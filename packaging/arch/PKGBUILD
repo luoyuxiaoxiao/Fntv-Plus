@@ -1,0 +1,96 @@
+# Maintainer: luoyuxiaoxiao <luoyuxiaoxiao@example.com>
+
+# 说明：当前工作区里的 Arch 原生路径修复尚未提交。
+# 发布前必须把 _commit 更新为包含这些改动的提交，并把 sha256sums 中的 SKIP 换成真实哈希。
+_commit=5bfd4e482437f70dd3da101215bdc245010ac17d
+
+pkgname=fntv-plus
+pkgver=3.7.0
+pkgrel=1
+pkgdesc='飞牛影视 Electron 桌面客户端增强版（系统 Electron + 系统 MPV 的 Arch 原生版）'
+arch=('x86_64')
+url='https://github.com/luoyuxiaoxiao/Fntv-Plus'
+license=('GPL3')
+depends=('electron41' 'mpv')
+makedepends=('go' 'nodejs' 'pnpm')
+options=('!strip')
+
+source=(
+  "$pkgname-$pkgver.tar.gz::https://github.com/luoyuxiaoxiao/Fntv-Plus/archive/${_commit}.tar.gz"
+  "fntv-plus"
+  "fntv-plus-x11"
+  "fntv-plus.desktop"
+)
+
+# 源码提交尚未固定到发布哈希，待 _commit 更新后补 sha256sums。
+sha256sums=(
+  'SKIP'
+  'd19ed2135a5a7919d4b0e6de4bbe46fc275e1190414b67c4de1ddf1eed2fe156'
+  '80cf15327ac11bf67b92487febf283e5480146988b0f6521b7773d8882cc75b7'
+  '5b93f545160e1832c4eb25f6e2ae0da37240c8ee561a0f5c18c8823a5a6fb7f8'
+)
+
+prepare() {
+  # 统一解压到独立目录，避免依赖 GitHub 归档顶层目录名。
+  mkdir -p "$srcdir/src"
+  tar -xf "$srcdir/$pkgname-$pkgver.tar.gz" -C "$srcdir/src" --strip-components=1
+
+  cd "$srcdir/src"
+  # 使用锁文件复现依赖，保证 TypeScript、Go、asar 等构建工具版本一致。
+  pnpm install --frozen-lockfile
+}
+
+build() {
+  cd "$srcdir/src"
+
+  # 先构建 Linux Go proxy，再编译 TypeScript 主进程/preload 产物。
+  pnpm run build:proxy:linux
+  pnpm run compile
+
+  # pnpm deploy 只提取生产依赖；仓库整体目录还包含源码和 Windows 资源，不能直接打 asar。
+  rm -rf "$srcdir/deploy" "$srcdir/app"
+  pnpm deploy --prod --frozen-lockfile "$srcdir/deploy"
+
+  mkdir -p "$srcdir/app/node_modules" "$srcdir/app/resource"
+  cp package.json "$srcdir/app/package.json"
+  cp -a dest build "$srcdir/app/"
+  cp -a resource/login resource/wiki resource/logos "$srcdir/app/resource/"
+  cp -a "$srcdir/deploy/node_modules/." "$srcdir/app/node_modules/"
+
+  # 使用仓库锁文件里的 @electron/asar 打包，避免依赖全局工具版本。
+  pnpm exec asar pack "$srcdir/app" "$srcdir/fntv-plus.asar"
+}
+
+package() {
+  # 启动器：Wayland/X11 会话共用系统 Electron，XWayland 兜底入口显式指定 x11。
+  install -Dm755 "$srcdir/fntv-plus" "$pkgdir/usr/bin/fntv-plus"
+  install -Dm755 "$srcdir/fntv-plus-x11" "$pkgdir/usr/bin/fntv-plus-x11"
+
+  # 只读应用根：app.asar 与第三方运行资源，安装后由 pacman 管理。
+  install -Dm644 "$srcdir/fntv-plus.asar" "$pkgdir/usr/lib/fntv-plus/app.asar"
+  install -Dm755 "$srcdir/src/third_party/proxy/proxy" \
+    "$pkgdir/usr/lib/fntv-plus/third_party/proxy/proxy"
+
+  install -d "$pkgdir/usr/lib/fntv-plus/third_party/fntv-mpv"
+  cp -a "$srcdir/src/third_party/fntv-mpv/portable_config" \
+    "$pkgdir/usr/lib/fntv-plus/third_party/fntv-mpv/"
+  # 与 electron-builder 的 files 规则保持一致，不把 Lua 调试备份打进包。
+  find "$pkgdir/usr/lib/fntv-plus/third_party/fntv-mpv/portable_config" \
+    -type f -name '*.bak*' -delete
+  install -d "$pkgdir/usr/lib/fntv-plus/third_party/anime"
+  cp -a "$srcdir/src/third_party/anime/." \
+    "$pkgdir/usr/lib/fntv-plus/third_party/anime/"
+
+  # Linux 下的 uosc ziggy 是 ELF 辅助程序，需要可执行位；Windows/macOS 二进制不进入 Linux 包。
+  chmod +x "$pkgdir/usr/lib/fntv-plus/third_party/fntv-mpv/portable_config/scripts/uosc/bin/ziggy-linux"
+
+  # 桌面集成与文档。
+  install -Dm644 "$srcdir/fntv-plus.desktop" \
+    "$pkgdir/usr/share/applications/fntv-plus.desktop"
+  install -Dm644 "$srcdir/src/build/icon.png" \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/fntv-plus.png"
+  install -Dm644 "$srcdir/src/LICENSE" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$srcdir/src/README.md" \
+    "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

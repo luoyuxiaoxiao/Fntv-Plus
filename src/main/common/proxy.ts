@@ -11,6 +11,7 @@ import { getMacCloseAction, setMacCloseAction, getTrayNotificationShown, setTray
 import * as log from '../../modules/logger';
 import { getDaemonInstance, ProxyDaemon } from './proxyDaemon';
 import { playbackShim } from './playbackShim';
+import { getAppInstallRoot } from './appPaths';
 
 
 // 全局守护程序实例
@@ -140,7 +141,8 @@ async function killOrphanProxy(port: number): Promise<void> {
     log.error(`[proxy] 孤儿进程已杀但 ${port} 仍被占用，新代理可能无法监听`);
 }
 
-// 获取应用中的proxy可执行文件路径
+// 获取应用中的 proxy 可执行文件路径。
+// 统一经 getAppInstallRoot() 推导：系统 Electron 不再用 electron 的 exe 目录。
 function getProxyExecPath(): string {
     // [lc-653] 二进制覆盖层：热补丁若写入 userData/patches/bin/proxy(.exe)，
     // 优先使用覆盖层版本（Go 代理修复可经热补丁生效，无需全量包）。
@@ -156,32 +158,8 @@ function getProxyExecPath(): string {
         }
     } catch { /* 覆盖层不可用时回退安装目录 */ }
 
-    // 检查是否在开发环境（未打包）
-    if (!app.isPackaged) {
-        // 未打包时使用相对路径
-        return process.platform === 'win32' 
-            ? ".\\third_party\\proxy\\proxy.exe"
-            : "./third_party/proxy/proxy";
-    }
-
-    // 已打包情况下的路径处理
-    if (process.platform === 'darwin') {
-        // macOS: third_party目录在应用包的Contents目录下，而不是在app.asar内
-        const appPath = app.getAppPath();
-        const contentsPath = path.dirname(path.dirname(appPath)); // 从app.asar向上两级到Contents
-        return path.join(contentsPath, 'third_party', 'proxy', 'proxy');
-    } else if (process.platform === 'win32') {
-        // Windows: extraFiles 把 third_party 复制到了 exe 同级目录。
-        // 必须用 exe 所在目录拼【绝对路径】，否则从开始菜单/快捷方式/UAC 启动时
-        // 进程 cwd 未必是安装目录，相对路径 ".\\third_party\\proxy\\proxy.exe"
-        // 会解析失败 -> existsSync=false -> 代理启动抛错 -> 主进程在创建窗口前即退出(表现为"打不开")。
-        return path.join(path.dirname(app.getPath('exe')), 'third_party', 'proxy', 'proxy.exe');
-    } else {
-        // Linux: 构建时只复制了proxy目录内容到third_party/proxy
-        const appPath = app.getAppPath();
-        const contentsPath = path.dirname(path.dirname(appPath));
-        return path.join(contentsPath, 'third_party', 'proxy', 'proxy');
-    }
+    return path.join(getAppInstallRoot(), 'third_party', 'proxy',
+        process.platform === 'win32' ? 'proxy.exe' : 'proxy');
 }
 
 /** 取得（必要时创建）全局守护实例 */

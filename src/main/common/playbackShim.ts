@@ -6,6 +6,7 @@ import * as path from 'path';
 import { app } from 'electron';
 import logger from '../../modules/logger';
 import { runBiliDanmaku, runBiliDanmakuCandidates, runBiliDanmakuByBvid } from './biliRunner';
+import { getUserMpvConfigDir } from './appPaths';
 import { ApiService } from '../../modules/fn_api/api';
 const log = logger.component('playbackShim');
 
@@ -678,7 +679,7 @@ class PlaybackShim {
         const roots = [process.env.PUBLIC, process.env.ProgramData, os.tmpdir()].filter(Boolean) as string[];
         const dirs = roots.map((r) => path.join(r, 'fnos-danmaku'));
         if (process.platform !== 'win32') {
-            dirs.push(path.join(os.homedir(), '.config', 'mpv', 'scripts', 'uosc_danmaku'));
+            dirs.push(path.join(getUserMpvConfigDir(), 'scripts', 'uosc_danmaku'));
         }
         return dirs;
     }

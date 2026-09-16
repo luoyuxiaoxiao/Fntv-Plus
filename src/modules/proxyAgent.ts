@@ -7,7 +7,7 @@ import * as fnConfig from './fn_config/config';
 const log = logger.component('proxy');
 
 /** 代理 agent 联合类型：HTTP/HTTPS 用 HttpsProxyAgent，SOCKS 用 SocksProxyAgent */
-export type ProxyAgent = HttpsProxyAgentMod.HttpsProxyAgent | SocksProxyAgentMod.SocksProxyAgent;
+export type ProxyAgent = HttpsProxyAgentMod.HttpsProxyAgent<string> | SocksProxyAgentMod.SocksProxyAgent;
 
 /**
  * 统一代理出口：让 Bangumi 每日放送、TMDB 等数据源走用户自定义代理。

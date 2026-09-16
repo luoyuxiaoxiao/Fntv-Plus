@@ -2,7 +2,6 @@ import { ChildProcess, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { app } from 'electron';
 import {
     BasePlayer,
     Config,
@@ -17,6 +16,7 @@ import {
 import { PlayerFactory } from '../factory';
 import logger from '../../logger';
 import { playbackShim } from '../../../main/common/playbackShim';
+import { getAppInstallRoot } from '../../../main/common/appPaths';
 const log = logger.component('potplayer');
 
 /**
@@ -984,16 +984,10 @@ export class PotPlayer extends BasePlayer {
      * 同时兜底 resources / app 路径，兼容不同运行形态。
      */
     private getPotctlPath(): string | null {
-        const candidates: string[] = [];
-        try {
-            candidates.push(path.join(path.dirname(app.getPath('exe')), 'third_party', 'proxy', 'potctl.exe'));
-        } catch (_) { /* ignore */ }
-        candidates.push(path.join(process.resourcesPath || '', 'third_party', 'proxy', 'potctl.exe'));
-        candidates.push(path.join(app.getAppPath(), 'third_party', 'proxy', 'potctl.exe'));
-        for (const c of candidates) {
-            if (c && fs.existsSync(c)) return c;
-        }
-        return null;
+        // 目前 potctl 仅随 Windows 包分发；Linux 不再按 electron exe 目录猜测。
+        if (process.platform !== 'win32') return null;
+        const candidate = path.join(getAppInstallRoot(), 'third_party', 'proxy', 'potctl.exe');
+        return fs.existsSync(candidate) ? candidate : null;
     }
 
     /**

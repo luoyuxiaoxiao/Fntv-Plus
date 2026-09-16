@@ -6,6 +6,7 @@ import * as os from 'os';
 import { registerHandler } from '../core/ipcHandler';
 import * as log from '../../../modules/logger';
 import { getQrcodeLibSource } from './qrcodeLib';
+import { getAppInstallRoot, getUserMpvConfigDir, isReadOnlyAppInstallDir } from '../../common/appPaths';
 
 /**
  * B站弹幕 Cookie 扫码登录（集成到设置面板）
@@ -40,22 +41,10 @@ function cookieHeader(): string {
 // 候选 uosc_danmaku 目录（dev / 打包 / 用户 mpv 目录），取首个存在者
 function getUoscDanmakuCandidates(): string[] {
   const arr: string[] = [];
-  // 仅在打包态使用 resourcesPath：dev 下它指向 node_modules/electron/dist/resources，
-  // 并非应用资源目录；往里写会污染 node_modules 并制造「存在但缺 bili_danmaku.js」的阴影目录。
-  if (app.isPackaged && process.resourcesPath) {
-    arr.push(path.join(process.resourcesPath, 'third_party', 'fntv-mpv', 'portable_config', 'scripts', 'uosc_danmaku'));
-  }
-  const appPath = app.getAppPath();
-  arr.push(path.join(appPath, 'third_party', 'fntv-mpv', 'portable_config', 'scripts', 'uosc_danmaku'));
-  // [新] 打包态 MPV 实际脚本目录：exe 同目录 portable_config（extraFiles 解压，可写）
-  //   与 apis/extra.lua 通过 mp.get_script_directory() 定位到的 bili_danmaku.js 同目录，
-  //   必须一致，否则 MPV 端读不到这里写的 bili_cookie.txt（换机/重装后弹幕搜索无登录态）。
-  arr.push(path.join(path.dirname(app.getPath('exe')), 'third_party', 'fntv-mpv', 'portable_config', 'scripts', 'uosc_danmaku'));
-  if (process.platform === 'win32') {
-    arr.push(path.join(os.homedir(), 'AppData', 'Roaming', 'mpv', 'scripts', 'uosc_danmaku'));
-  } else {
-    arr.push(path.join(os.homedir(), '.config', 'mpv', 'scripts', 'uosc_danmaku'));
-  }
+  // 安装目录携带的脚本（dev/electron-builder/Arch 原生包均适用）
+  arr.push(path.join(getAppInstallRoot(), 'third_party', 'fntv-mpv', 'portable_config', 'scripts', 'uosc_danmaku'));
+  // 用户 MPV 目录中的可写副本：Arch 下是唯一可写落盘位置
+  arr.push(path.join(getUserMpvConfigDir(), 'scripts', 'uosc_danmaku'));
   return arr;
 }
 
@@ -71,12 +60,12 @@ function resolveDanmakuDir(): string | null {
   }
   // 2) 其次：非 asar 的真实可写目录（exe 同目录 portable_config / 用户 mpv）
   for (const c of candidates) {
-    if (isAsarPath(c)) continue;
+    if (isAsarPath(c) || isReadOnlyAppInstallDir(c)) continue;
     if (fs.existsSync(c)) return c;
   }
-  // 3) 回退：第一个非 asar 候选（即便尚不存在，mkdir 后也可写）
+  // 3) 回退：第一个非 asar 且非只读安装目录的候选（即便尚不存在，mkdir 后也可写）
   for (const c of candidates) {
-    if (isAsarPath(c)) continue;
+    if (isAsarPath(c) || isReadOnlyAppInstallDir(c)) continue;
     return c;
   }
   return null;
@@ -112,8 +101,8 @@ function harvestSetCookie(sc?: string | string[]): string {
 function saveCookie(ck: string): void {
   const candidates = getUoscDanmakuCandidates();
   // 排除只读的 asar 路径（打包态 resourcesPath/appPath 指向 app.asar 内部，写入静默失败）；
-  // 优先写入 exe 同目录 portable_config（与 MPV 实际脚本目录一致，确保 MPV 端能读到此 cookie）。
-  const writable = candidates.filter((d) => !isAsarPath(d));
+  // Arch 额外排除 /usr/lib/fntv-plus；cookie 只写用户 MPV 目录。
+  const writable = candidates.filter((d) => !isAsarPath(d) && !isReadOnlyAppInstallDir(d));
   let saved = false;
   for (const dir of writable) {
     try {

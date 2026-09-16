@@ -1,8 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { app } from 'electron';
 import logger from '../../modules/logger';
 import * as danmuApi from './danmuApi';
+import { getAppInstallRoot, getUserMpvConfigDir } from './appPaths';
 const log = logger.component('biliRunner');
 
 /**
@@ -61,23 +61,10 @@ let logSinkBound = false;
 // ---- 候选 uosc_danmaku 脚本目录（与 biliCookie.ts / biliDanmaku.ts 保持一致）----
 function resolveDanmakuScriptDir(): string | null {
     const candidates: string[] = [];
-    // 仅在打包态使用 resourcesPath：dev 下它指向 node_modules/electron/dist/resources，
-    // 并非应用资源目录；往里写会污染 node_modules 并制造「存在但缺 bili_danmaku.js」的阴影目录。
-    if (app.isPackaged && process.resourcesPath) {
-        candidates.push(path.join(process.resourcesPath, 'third_party', 'fntv-mpv', 'portable_config', 'scripts', 'uosc_danmaku'));
-    }
-    try {
-        candidates.push(path.join(app.getAppPath(), 'third_party', 'fntv-mpv', 'portable_config', 'scripts', 'uosc_danmaku'));
-    } catch (_) { /* ignore */ }
-    // 打包态 MPV 实际脚本目录：exe 同目录 portable_config（extraFiles 解压，可写）
-    try {
-        candidates.push(path.join(path.dirname(app.getPath('exe')), 'third_party', 'fntv-mpv', 'portable_config', 'scripts', 'uosc_danmaku'));
-    } catch (_) { /* ignore */ }
-    if (process.platform === 'win32') {
-        candidates.push(path.join(process.env.LOCALAPPDATA || '', '..', 'Roaming', 'mpv', 'scripts', 'uosc_danmaku'));
-    } else {
-        candidates.push(path.join(process.env.HOME || '', '.config', 'mpv', 'scripts', 'uosc_danmaku'));
-    }
+    // 安装目录中的只读脚本（dev/electron-builder/Arch 原生包均适用）
+    candidates.push(path.join(getAppInstallRoot(), 'third_party', 'fntv-mpv', 'portable_config', 'scripts', 'uosc_danmaku'));
+    // 用户 MPV 目录中的可写脚本副本
+    candidates.push(path.join(getUserMpvConfigDir(), 'scripts', 'uosc_danmaku'));
     // 关键修复：目录存在 ≠ 脚本齐备。必须确认 bili_danmaku.js 真实存在，
     // 否则会命中「存在但缺文件」的候选（如 dev 下 resourcesPath 目录被 cookie 落盘创建、
     // 却不含 bili_danmaku.js），导致加载失败。优先选含脚本的目录。

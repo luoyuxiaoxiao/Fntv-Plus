@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.1
+Name=Fntv-Plus
+Name[zh_CN]=飞牛影视增强版
+Comment=Fntv-Plus desktop client
+Comment[zh_CN]=飞牛影视桌面客户端增强版
+Exec=fntv-plus
+Icon=fntv-plus
+Terminal=false
+Categories=AudioVideo;Video;Player;
+StartupNotify=true
+StartupWMClass=fntv-plus

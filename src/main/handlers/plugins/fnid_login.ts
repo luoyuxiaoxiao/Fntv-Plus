@@ -1160,7 +1160,8 @@ export async function handleFnIdLogin(event: IpcMainEvent, loginData: LoginData)
             }
 
             // 监听 console 消息（JS bridge）
-            oauthWindow!.webContents.on('console-message', (_event, _level, message) => {
+            oauthWindow!.webContents.on('console-message', (event: any, ...legacy: any[]) => {
+                const message = typeof event?.message === 'string' ? event.message : legacy[1];
                 if (message.startsWith('__FNTV_BRIDGE__:')) {
                     const jsonStr = message.substring('__FNTV_BRIDGE__:'.length);
                     try {

@@ -1,0 +1,4 @@
+#!/bin/sh
+
+# XWayland 兜底入口：显式使用 X11 Ozone，避免 niri 等纯 Wayland 合成器的兼容问题。
+exec /usr/bin/electron41 --ozone-platform=x11 /usr/lib/fntv-plus/app.asar "$@"

@@ -11,8 +11,10 @@ import { getInstance as getUpdateChecker } from '../../../modules/updater/update
 import { clearAllPatches } from '../../../modules/patcher/patchApplier';
 import { setMpvPlayerPath, setPotPlayerPath } from './media';
 import { writeMpvUserConfig, writeBiliSearchEnabled, writeBiliAggregateThreshold, writeBiliDanmakuStyle, writeInterpConfig, getPortableConfigDir, writeDandanplayCredentials, writeDanmuApiConf, applyRenderPreset, ensureStatsKeyBinding } from './mpvConfig';
+import { getWritableMpvConfigDirs } from './mpvConfig';
 import * as danmuApi from '../../common/danmuApi';
 import * as log from '../../../modules/logger';
+import { getAppInstallRoot } from '../../common/appPaths';
 
 /**
  * 设置面板 IPC 插件
@@ -281,7 +283,7 @@ function copyLoginBgToUserData(src: string): string | null {
 // 弹出系统文件选择框，选择自定义登录页背景图（默认打开 resource/login/image 目录）
 async function handlePickLoginBg(): Promise<string | null> {
     const win = getMainWindow();
-    const base = app.isPackaged ? path.dirname(app.getPath('exe')) : app.getAppPath();
+    const base = getAppInstallRoot();
     const defaultPath = path.join(base, 'resource', 'login', 'image');
     try {
         const result = await dialog.showOpenDialog(win ?? undefined, {
@@ -590,7 +592,7 @@ async function handleGetDiagnostics(): Promise<any> {
     try {
         const c: any = fnConfig.readConfig ? fnConfig.readConfig() : null;
         const cfg = c || {};
-        const portableDir = getPortableConfigDir();
+        const portableDir = getWritableMpvConfigDirs()[0] || getPortableConfigDir();
         const mpvUserConf = readFileSafe(path.join(portableDir, 'mpv-user.conf'));
         const danmakuConf = readFileSafe(path.join(portableDir, 'script-opts', 'uosc_danmaku.conf'));
         let version = '';
@@ -598,7 +600,7 @@ async function handleGetDiagnostics(): Promise<any> {
         return {
             ok: true,
             version,
-            appPath: app.isPackaged ? path.dirname(app.getPath('exe')) : app.getAppPath(),
+            appPath: app.isPackaged ? getAppInstallRoot() : app.getAppPath(),
             isPackaged: app.isPackaged,
             // 登录态
             domain: cfg.domain || '(未设置)',

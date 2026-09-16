@@ -1,9 +1,13 @@
 import { app } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import * as logger from '../../../modules/logger';
 import * as fnConfig from '../../../modules/fn_config/config';
+import {
+    getBundledMpvConfigDir,
+    getUserMpvConfigDir,
+    isArchNativeRuntime,
+} from '../../common/appPaths';
 
 /**
  * MPV配置文件管理插件
@@ -14,42 +18,23 @@ let configCheckInterval: NodeJS.Timeout | null = null;
 
 // 获取用户MPV配置目录
 function getMpvConfigDir(): string {
-    const homeDir = os.homedir();
-    if (process.platform === 'win32') {
-        return path.join(homeDir, 'AppData', 'Roaming', 'mpv');
-    } else {
-        return path.join(homeDir, '.config', 'mpv');
-    }
+    return getUserMpvConfigDir();
 }
 
-// 获取应用中的portable_config目录
-// ⚠️ 关键：必须返回 MPV 实际读取的【可写】目录。
-//   - 开发模式：app.getAppPath() = 项目根目录，CWD = 项目根目录 → 两者一致，可写。
-//   - 打包模式：app.getAppPath() = resources/app.asar（只读虚拟路径！），
-//     而 extraFiles 把 third_party/fntv-mpv 解压到【exe 同级目录】（可写），
-//     MPV 以相对路径 + CWD=exe目录 启动 → 实际读取 exe 目录下的 portable_config。
-//     故打包后必须用 path.dirname(app.getPath('exe')) 拼接，否则写 mpv-user.conf 会写进
-//     只读 asar 导致静默失败（面板改了默认着色器但不生效）。
+// 获取应用携带的 portable_config（默认模板/脚本的只读来源）。
+// Arch 原生包中这是 /usr/lib/fntv-plus 下的 pacman 管辖区，只能读、不能写。
 function getPortableConfigDir(): string {
-    const sub = path.join('third_party', 'fntv-mpv', 'portable_config');
-    if (process.platform === 'darwin') {
-        // macOS: third_party目录在应用包的Contents目录下（extraFiles 解压到 Contents/）
-        const appPath = app.getAppPath();
-        const contentsPath = path.dirname(path.dirname(appPath)); // 从app.asar向上两级到Contents
-        return path.join(contentsPath, 'third_party', 'fntv-mpv', 'portable_config');
-    } else if (process.platform === 'win32') {
-        // Windows: extraFiles 将 third_party/fntv-mpv 解压到 exe 同级目录
-        if (app.isPackaged) {
-            return path.join(path.dirname(app.getPath('exe')), sub);
-        }
-        return path.join(app.getAppPath(), sub);
-    } else {
-        // Linux: 同 Windows，extraFiles 解压到 exe 同级目录
-        if (app.isPackaged) {
-            return path.join(path.dirname(app.getPath('exe')), sub);
-        }
-        return path.join(app.getAppPath(), sub);
-    }
+    return getBundledMpvConfigDir();
+}
+
+/**
+ * 应用设置写入的 MPV 配置目录。
+ * 非 Arch 仍保留 portable_config + 用户目录双写兼容旧形态；
+ * Arch 系统权限下只允许写用户 ~/.config/mpv，避免 /usr/lib 写入 EACCES。
+ */
+export function getWritableMpvConfigDirs(): string[] {
+    if (isArchNativeRuntime()) return [getMpvConfigDir()];
+    return [getPortableConfigDir(), getMpvConfigDir()];
 }
 
 // 递归复制目录
@@ -81,6 +66,42 @@ function copyDirectoryRecursive(source: string, destination: string): void {
     });
 }
 
+// 只补缺失文件的目录复制：不覆盖用户已有的 mpv.conf、input.conf、脚本等自定义内容。
+function copyDirectoryRecursivePreserve(source: string, destination: string): void {
+    if (!fs.existsSync(source)) return;
+    if (!fs.existsSync(destination)) fs.mkdirSync(destination, { recursive: true });
+
+    for (const item of fs.readdirSync(source)) {
+        const srcPath = path.join(source, item);
+        const destPath = path.join(destination, item);
+        const stat = fs.statSync(srcPath);
+        if (stat.isDirectory()) {
+            copyDirectoryRecursivePreserve(srcPath, destPath);
+        } else if (!fs.existsSync(destPath)) {
+            fs.copyFileSync(srcPath, destPath);
+            // 保留可执行位：uosc 的 ziggy-linux 需要 +x 才能被 MPV 子进程调用。
+            if (stat.mode & 0o111) fs.chmodSync(destPath, stat.mode & 0o777);
+        }
+    }
+}
+
+// Arch 系统 MPV 首启准备：把只读 portable_config 同步到用户配置目录。
+// 只补缺失文件，绝不用安装目录覆盖用户已有配置；即使已有 scripts 目录，
+// 也会单独补齐应用托管的 uosc_danmaku（否则系统 MPV 读不到弹幕脚本）。
+function ensureUserMpvDefaults(): void {
+    const srcDir = getPortableConfigDir();
+    const dstDir = getMpvConfigDir();
+    if (!fs.existsSync(srcDir)) {
+        logger.log(`Portable config directory not found: ${srcDir}`);
+        return;
+    }
+    copyDirectoryRecursivePreserve(srcDir, dstDir);
+    copyDirectoryRecursivePreserve(
+        path.join(srcDir, 'scripts', 'uosc_danmaku'),
+        path.join(dstDir, 'scripts', 'uosc_danmaku')
+    );
+}
+
 // 检查并复制配置文件
 function checkAndCopyMpvConfig(): void {
     try {
@@ -88,8 +109,10 @@ function checkAndCopyMpvConfig(): void {
         const scriptsDir = path.join(mpvConfigDir, 'scripts');
         const portableConfigDir = getPortableConfigDir();
 
-        // 检查scripts目录是否存在
-        if (!fs.existsSync(scriptsDir)) {
+        // Arch 系统 MPV：始终按「只补缺失」策略同步默认配置到用户目录
+        if (isArchNativeRuntime()) {
+            ensureUserMpvDefaults();
+        } else if (!fs.existsSync(scriptsDir)) {
             logger.log(`Scripts directory not found, copying from portable config...`);
 
             // 确保MPV配置目录存在
@@ -345,7 +368,7 @@ function writeMpvUserConfig(shaderKey: string, iccEnabled: boolean): void {
         //   - 标准模式（读系统用户配置目录 AppData/Roaming/mpv 等）：读该目录下的 mpv-user.conf
         // 旧实现只写 portable_config，而 checkAndCopyMpvConfig 仅在首次运行拷贝一次，
         // 之后面板改的着色器写进死目录、正在运行的 MPV 读的是首次拷贝的旧文件 → 「选了不生效」。
-        const dirs = [getPortableConfigDir(), getMpvConfigDir()];
+        const dirs = getWritableMpvConfigDirs();
         for (const dir of dirs) {
             try {
                 if (!fs.existsSync(dir)) {
@@ -386,7 +409,7 @@ export function writeInterpConfig(enabled: boolean, engine: string, enginePath: 
             ''
         ];
         const content = lines.join('\n');
-        const dirs = [getPortableConfigDir(), getMpvConfigDir()];
+        const dirs = getWritableMpvConfigDirs();
         for (const dir of dirs) {
             try {
                 const scriptOptsDir = path.join(dir, 'script-opts');
@@ -419,7 +442,7 @@ function writeInterpNvidiaContext(enabled: boolean): void {
               + 'gpu-context=winvk\n'
               + 'video-sync=audio\n'
             : '# Fntv-Plus · N 卡 Smooth Motion 未启用（空）\n';
-        const dirs = [getPortableConfigDir(), getMpvConfigDir()];
+        const dirs = getWritableMpvConfigDirs();
         for (const dir of dirs) {
             try {
                 if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -446,7 +469,7 @@ function writeInterpNvidiaContext(enabled: boolean): void {
 function writeBiliSearchEnabled(enabled: boolean): void {
     try {
         const val = enabled ? 'yes' : 'no';
-        const dirs = [getPortableConfigDir(), getMpvConfigDir()];
+        const dirs = getWritableMpvConfigDirs();
         for (const dir of dirs) {
             try {
                 const scriptOptsDir = path.join(dir, 'script-opts');
@@ -482,7 +505,7 @@ function writeBiliSearchEnabled(enabled: boolean): void {
 function writeThumbfastConf(playerPath: string): void {
     try {
         const conf = 'mpv_path=' + playerPath;
-        const dirs = [getPortableConfigDir(), getMpvConfigDir()];
+        const dirs = getWritableMpvConfigDirs();
         for (const dir of dirs) {
             try {
                 const scriptOptsDir = path.join(dir, 'script-opts');
@@ -504,7 +527,7 @@ function writeThumbfastConf(playerPath: string): void {
 function writeSmartSkipEnabled(enabled: boolean): void {
     try {
         const val = enabled ? 'yes' : 'no';
-        const dirs = [getPortableConfigDir(), getMpvConfigDir()];
+        const dirs = getWritableMpvConfigDirs();
         for (const dir of dirs) {
             try {
                 const scriptOptsDir = path.join(dir, 'script-opts');
@@ -536,25 +559,27 @@ function writeSmartSkipEnabled(enabled: boolean): void {
 // 写入 B站弹幕聚合阈值到 script-opts/uosc_danmaku.conf（由应用设置面板控制）
 function writeBiliAggregateThreshold(threshold: number): void {
     try {
-        const dir = getPortableConfigDir();
-        const scriptOptsDir = path.join(dir, 'script-opts');
-        if (!fs.existsSync(scriptOptsDir)) {
-            fs.mkdirSync(scriptOptsDir, { recursive: true });
+        const dirs = getWritableMpvConfigDirs();
+        for (const dir of dirs) {
+            const scriptOptsDir = path.join(dir, 'script-opts');
+            if (!fs.existsSync(scriptOptsDir)) {
+                fs.mkdirSync(scriptOptsDir, { recursive: true });
+            }
+            const target = path.join(scriptOptsDir, 'uosc_danmaku.conf');
+            let lines: string[] = [];
+            if (fs.existsSync(target)) {
+                lines = fs.readFileSync(target, 'utf-8').split(/\r?\n/);
+            }
+            // 移除已存在的 aggregate_threshold 行及旧注释，避免重复堆叠
+            lines = lines.filter(l => !/^\s*aggregate_threshold\s*=/.test(l)
+                && !/^#\s*B站弹幕聚合阈值/.test(l));
+            while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
+            const t = Number(threshold) || 0;
+            lines.push('# B站弹幕聚合阈值（单视频弹幕<此值时合并同类候选；0=禁用）');
+            lines.push('aggregate_threshold=' + t);
+            fs.writeFileSync(target, lines.join('\n') + '\n', 'utf-8');
+            logger.info(`MPV B站弹幕聚合阈值已写入: ${target} (threshold=${t})`);
         }
-        const target = path.join(scriptOptsDir, 'uosc_danmaku.conf');
-        let lines: string[] = [];
-        if (fs.existsSync(target)) {
-            lines = fs.readFileSync(target, 'utf-8').split(/\r?\n/);
-        }
-        // 移除已存在的 aggregate_threshold 行及旧注释，避免重复堆叠
-        lines = lines.filter(l => !/^\s*aggregate_threshold\s*=/.test(l)
-            && !/^#\s*B站弹幕聚合阈值/.test(l));
-        while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
-        const t = Number(threshold) || 0;
-        lines.push('# B站弹幕聚合阈值（单视频弹幕<此值时合并同类候选；0=禁用）');
-        lines.push('aggregate_threshold=' + t);
-        fs.writeFileSync(target, lines.join('\n') + '\n', 'utf-8');
-        logger.info(`MPV B站弹幕聚合阈值已写入: ${target} (threshold=${t})`);
     } catch (error) {
         logger.error('写入 uosc_danmaku.conf (aggregate_threshold) 失败:', error);
     }
@@ -570,7 +595,7 @@ function writeDandanplayCredentials(appId: string, appSecret: string): void {
     try {
         const id = String(appId || '').trim();
         const secret = String(appSecret || '').trim();
-        const dirs = [getPortableConfigDir(), getMpvConfigDir()];
+        const dirs = getWritableMpvConfigDirs();
         for (const dir of dirs) {
             try {
                 const scriptOptsDir = path.join(dir, 'script-opts');
@@ -615,7 +640,7 @@ function writeDanmuApiConf(enabled: boolean, base: string): void {
     try {
         const on = !!enabled;
         const hasBase = !!String(base || '').trim();
-        const dirs = [getPortableConfigDir(), getMpvConfigDir()];
+        const dirs = getWritableMpvConfigDirs();
         for (const dir of dirs) {
             try {
                 const scriptOptsDir = path.join(dir, 'script-opts');
@@ -660,7 +685,7 @@ function writeBiliDanmakuStyle(): void {
         const maxScreen = fnConfig.getBiliDanmakuMaxScreen();
         const blacklist = fnConfig.getBiliDanmakuBlacklist() || '';
 
-        const dirs = [getPortableConfigDir(), getMpvConfigDir()];
+        const dirs = getWritableMpvConfigDirs();
         for (const dir of dirs) {
             try {
                 const scriptOptsDir = path.join(dir, 'script-opts');
@@ -711,10 +736,12 @@ function writeBiliDanmakuStyle(): void {
 // 插件初始化函数
 function init(): void {
     logger.info('Initializing MPV Config Plugin...');
-    // 只在macOS上执行
-    if (process.platform === 'win32' || process.platform === 'linux') {
+    // Windows/electron-builder Linux 沿用便携配置，不接管用户 config；
+    // Arch 系统 MPV 必须把只读模板同步到 XDG 配置目录，因此需要启动检查。
+    if (process.platform === 'win32') {
         return;
     }
+    if (process.platform === 'linux' && !isArchNativeRuntime()) return;
 
     startConfigCheck();
     // 应用退出前停止检查
@@ -737,7 +764,7 @@ export function applyRenderPreset(preset: string): void {
 export function ensureStatsKeyBinding(): void {
     const line = 'F          script-binding stats/display-stats-toggle                                      #menu: 播放 > 视频统计信息';
     const marker = 'script-binding stats/display-stats-toggle';
-    const dirs = [getPortableConfigDir(), getMpvConfigDir()];
+    const dirs = getWritableMpvConfigDirs();
     for (const dir of dirs) {
         try {
             const target = path.join(dir, 'input.conf');

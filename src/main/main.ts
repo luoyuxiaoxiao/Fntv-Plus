@@ -208,7 +208,17 @@ if (!gotTheLock) {
             // (fnOS 页面自身的 JS 报错默认不会写入 app.log, 这里统一收集)
             try {
                 const wc = mainWindow.webContents;
-                wc.on('console-message', (_e: any, level: number, message: string, line?: number, sourceId?: string) => {
+                // Electron 41 将事件参数收进 Event 对象；旧 Electron 38 仍按位置传参。
+                // 用单参+rest 监听可同时兼容两者，且不触发 41 的弃用警告。
+                wc.on('console-message', (event: any, ...legacy: any[]) => {
+                    const isNewEvent = typeof event?.level === 'string' && typeof event?.message === 'string';
+                    const levelMap: Record<string, number> = { info: 1, warning: 2, error: 3, debug: 0 };
+                    const level = isNewEvent
+                        ? (levelMap[event.level] ?? 1)
+                        : (legacy[0] as number | undefined ?? 1);
+                    const message = isNewEvent ? event.message : legacy[1];
+                    const line = isNewEvent ? event.lineNumber : legacy[2];
+                    const sourceId = isNewEvent ? event.sourceId : legacy[3];
                     const tag = level >= 3 ? 'ERROR' : level === 2 ? 'WARN' : level === 1 ? 'INFO' : 'DEBUG';
                     const full = `[Renderer:${tag}] ${message}${line ? ' (line ' + line + ')' : ''}${sourceId ? ' @ ' + sourceId : ''}`;
                     // 按真实级别写入, 使渲染进程的 WARN/ERROR 能进入 app-error.log (修复此前一律 log.info 导致降级丢失)

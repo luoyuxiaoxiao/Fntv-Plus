@@ -1,0 +1,5 @@
+#!/bin/sh
+
+# Arch 原生版启动入口：使用系统 electron41 加载只读 app.asar。
+# Wayland 由 Electron/Chromium 根据会话自动选择；如遇到 Wayland 兼容问题，可用 fntv-plus-x11。
+exec /usr/bin/electron41 /usr/lib/fntv-plus/app.asar "$@"
