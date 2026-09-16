@@ -10,8 +10,8 @@ pkgrel=1
 pkgdesc='飞牛影视 Electron 桌面客户端增强版（系统 Electron + 系统 MPV 的 Arch 原生版）'
 arch=('x86_64')
 url='https://github.com/luoyuxiaoxiao/Fntv-Plus'
-license=('GPL3')
-depends=('electron41' 'mpv')
+license=('GPL-3.0-only')
+depends=('electron41' 'mpv' 'python')
 makedepends=('go' 'nodejs' 'pnpm')
 options=('!strip')
 
@@ -37,7 +37,9 @@ prepare() {
 
   cd "$srcdir/src"
   # 使用锁文件复现依赖，保证 TypeScript、Go、asar 等构建工具版本一致。
-  pnpm install --frozen-lockfile
+  # Arch 构建只需要 TypeScript、Go proxy 与 ASAR 工具，不需要执行 Electron、sharp 等可选原生依赖的安装脚本。
+  # 禁用生命周期脚本可避免 sharp 在隔离构建环境中误触发源码编译，同时不影响后续 compile 与 asar pack。
+  pnpm install --frozen-lockfile --ignore-scripts
 }
 
 build() {
@@ -47,18 +49,42 @@ build() {
   pnpm run build:proxy:linux
   pnpm run compile
 
-  # pnpm deploy 只提取生产依赖；仓库整体目录还包含源码和 Windows 资源，不能直接打 asar。
-  rm -rf "$srcdir/deploy" "$srcdir/app"
-  pnpm deploy --prod --frozen-lockfile "$srcdir/deploy"
-
-  mkdir -p "$srcdir/app/node_modules" "$srcdir/app/resource"
-  cp package.json "$srcdir/app/package.json"
+  # 在独立 staging 中以 hoisted 模式安装生产依赖，消除 pnpm 符号链接布局。
+  # Electron 的 ASAR 文件系统不能可靠解析指向 .pnpm 虚拟存储的链接，因此打包前强制转为普通目录。
+  rm -rf "$srcdir/app"
+  mkdir -p "$srcdir/app/resource"
+  cp package.json pnpm-lock.yaml pnpm-workspace.yaml "$srcdir/app/"
   cp -a dest build "$srcdir/app/"
   cp -a resource/login resource/wiki resource/logos "$srcdir/app/resource/"
-  cp -a "$srcdir/deploy/node_modules/." "$srcdir/app/node_modules/"
+  pnpm --dir "$srcdir/app" install \
+    --prod \
+    --frozen-lockfile \
+    --node-linker=hoisted \
+    --ignore-scripts
 
-  # 使用仓库锁文件里的 @electron/asar 打包，避免依赖全局工具版本。
-  pnpm exec asar pack "$srcdir/app" "$srcdir/fntv-plus.asar"
+  # ASAR 内禁止保留依赖符号链接，避免运行时再次出现模块入口无法解析。
+  if find "$srcdir/app/node_modules" -type l -print -quit | grep -q .; then
+    echo '错误：生产依赖仍包含符号链接，拒绝生成不可运行的 ASAR。' >&2
+    return 1
+  fi
+
+  # pnpm 的命令 shim 与安装元数据会记录 staging 绝对路径，运行时模块加载不依赖它们。
+  # 在打包前移除这些构建期文件，避免 ASAR 泄漏 $srcdir 并改善构建可复现性。
+  rm -rf "$srcdir/app/node_modules/.bin"
+  rm -f "$srcdir/app/node_modules/.modules.yaml"
+  rm -f "$srcdir/app/node_modules/.pnpm/lock.yaml"
+  rm -f "$srcdir/app/node_modules/.pnpm-workspace-state-v1.json"
+  rm -f "$srcdir/app/dest/.tsbuildinfo"
+
+  # @electron/asar 是 electron-builder 的传递依赖，不会生成根级 .bin 入口。
+  # 直接执行锁文件安装出的固定版本脚本，避免 pnpm exec 无法找到传递依赖命令。
+  local asar_cli
+  asar_cli=$(find node_modules/.pnpm -path '*/node_modules/@electron/asar/bin/asar.js' -print -quit)
+  if [[ -z "$asar_cli" ]]; then
+    echo '错误：未找到锁文件安装的 @electron/asar 打包脚本。' >&2
+    return 1
+  fi
+  node "$asar_cli" pack "$srcdir/app" "$srcdir/fntv-plus.asar"
 }
 
 package() {
@@ -72,13 +98,14 @@ package() {
     "$pkgdir/usr/lib/fntv-plus/third_party/proxy/proxy"
 
   install -d "$pkgdir/usr/lib/fntv-plus/third_party/fntv-mpv"
-  cp -a "$srcdir/src/third_party/fntv-mpv/portable_config" \
+  # fakeroot 在 tmpfs 上无法模拟部分目录的所有权写入；包内所有权最终统一由 makepkg 规范化。
+  cp -a --no-preserve=ownership "$srcdir/src/third_party/fntv-mpv/portable_config" \
     "$pkgdir/usr/lib/fntv-plus/third_party/fntv-mpv/"
   # 与 electron-builder 的 files 规则保持一致，不把 Lua 调试备份打进包。
   find "$pkgdir/usr/lib/fntv-plus/third_party/fntv-mpv/portable_config" \
     -type f -name '*.bak*' -delete
   install -d "$pkgdir/usr/lib/fntv-plus/third_party/anime"
-  cp -a "$srcdir/src/third_party/anime/." \
+  cp -a --no-preserve=ownership "$srcdir/src/third_party/anime/." \
     "$pkgdir/usr/lib/fntv-plus/third_party/anime/"
 
   # Linux 下的 uosc ziggy 是 ELF 辅助程序，需要可执行位；Windows/macOS 二进制不进入 Linux 包。
