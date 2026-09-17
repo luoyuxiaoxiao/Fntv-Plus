@@ -1,0 +1,58 @@
+name: Arch Package
+
+on:
+  # 手动触发，或在推送改动 packaging/arch/ 下文件时自动构建。
+  # 不跟随上游 release.yml（上游构建 dmg/AppImage，与此无关）。
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'packaging/arch/**'
+      - '.github/workflows/arch-package.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    timeout-minutes: 30
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm git go nodejs pnpm mpv python namcap
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build package
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg -f --nodeps"
+        # --nodeps：CI 不安装 electron41（AUR 包，仅运行时依赖，构建用不到）；
+        # 产出的包内 depends 元数据仍按 PKGBUILD 记录，本地 pacman -U 时正常校验。
+
+      - name: Audit package
+        run: namcap packaging/arch/fntv-plus-*.pkg.tar.zst
+
+      - name: Read package version
+        id: pkgver
+        run: echo "version=$(grep -m1 '^pkgver=' packaging/arch/PKGBUILD | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Attach to Release
+        # 附加到 v<pkgver> Release，与 release.yml 的命名一致：同一版本一个 Release，
+        # 内含 dmg/AppImage（上游产物）和 .pkg.tar.zst（本 workflow 产物）。
+        # Release 说明文字仍由维护者在页面上手动填写。
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.pkgver.outputs.version }}
+          files: packaging/arch/*.pkg.tar.zst
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
