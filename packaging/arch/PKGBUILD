@@ -59,20 +59,21 @@ build() {
     --node-linker=hoisted \
     --ignore-scripts
 
+  # pnpm 的命令 shim 与安装元数据会记录 staging 绝对路径，运行时模块加载不依赖它们。
+  # pnpm 11 即使在 hoisted 模式下也会生成 .bin 符号链接与 .pnpm 虚拟存储，先移除再检查；
+  # 清理后仍存在的符号链接才是真正的依赖解析链接，此时检查才有意义。
+  rm -rf "$srcdir/app/node_modules/.bin"
+  rm -rf "$srcdir/app/node_modules/.pnpm"
+  rm -f "$srcdir/app/node_modules/.modules.yaml"
+  rm -f "$srcdir/app/node_modules/.pnpm-workspace-state-v1.json"
+  rm -f "$srcdir/app/dest/.tsbuildinfo"
+
   # ASAR 内禁止保留依赖符号链接，避免运行时再次出现模块入口无法解析。
   if find "$srcdir/app/node_modules" -type l -print -quit | grep -q .; then
     echo '错误：生产依赖仍包含符号链接，拒绝生成不可运行的 ASAR。' >&2
     find "$srcdir/app/node_modules" -type l | head -50 >&2
     return 1
   fi
-
-  # pnpm 的命令 shim 与安装元数据会记录 staging 绝对路径，运行时模块加载不依赖它们。
-  # 在打包前移除这些构建期文件，避免 ASAR 泄漏 $srcdir 并改善构建可复现性。
-  rm -rf "$srcdir/app/node_modules/.bin"
-  rm -f "$srcdir/app/node_modules/.modules.yaml"
-  rm -f "$srcdir/app/node_modules/.pnpm/lock.yaml"
-  rm -f "$srcdir/app/node_modules/.pnpm-workspace-state-v1.json"
-  rm -f "$srcdir/app/dest/.tsbuildinfo"
 
   # @electron/asar 是 electron-builder 的传递依赖，不会生成根级 .bin 入口。
   # 直接执行锁文件安装出的固定版本脚本，避免 pnpm exec 无法找到传递依赖命令。
