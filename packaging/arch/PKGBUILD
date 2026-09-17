@@ -62,6 +62,7 @@ build() {
   # ASAR 内禁止保留依赖符号链接，避免运行时再次出现模块入口无法解析。
   if find "$srcdir/app/node_modules" -type l -print -quit | grep -q .; then
     echo '错误：生产依赖仍包含符号链接，拒绝生成不可运行的 ASAR。' >&2
+    find "$srcdir/app/node_modules" -type l | head -50 >&2
     return 1
   fi
 
