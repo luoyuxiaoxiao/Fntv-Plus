@@ -35,3 +35,6 @@ jobs:
             exit 1
           }
           git push origin main
+          # fork 自建的同名 tag（如 v3.7.0）与上游同名 tag 指向不同提交时，
+          # 按上游为准强制同步（上游是版本真相源；如需保留 fork tag 请先改名）。
+          git push origin --tags --force-with-lease
