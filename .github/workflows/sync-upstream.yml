@@ -28,7 +28,7 @@ jobs:
           git remote add upstream https://github.com/YDMY007/Fntv-Plus.git 2>/dev/null || true
           # 同名 tag 指向分叉时普通 fetch 会整批失败（! rejected would clobber）；
           # 用 + 强制按上游为准更新（上游是版本真相源）。
-          git fetch upstream '+refs/tags/*:refs/tags/*'
+          git fetch upstream '+refs/tags/*:refs/tags/*' '+refs/heads/release:refs/remotes/upstream/release'
           git checkout main
           # 快进则快进，否则 merge（保留 fork 自有改动）；冲突即失败，人工处理。
           git merge --no-edit upstream/release || {
