@@ -39,4 +39,8 @@ jobs:
           git push origin main
           # fork 自建的同名 tag（如 v3.7.0）与上游同名 tag 指向不同提交时，
           # 按上游为准强制同步（上游是版本真相源；如需保留 fork tag 请先改名）。
-          git push origin --tags --force-with-lease
+          # 注意：先删本地已抓取的上游 tags 再重新抓，保证 push 的 refs 是最新的，
+          # 否则 stale info 导致 rejected（fetch 与 push 之间上游 tag 又被改写）。
+          git tag -l | xargs -r git tag -d >/dev/null
+          git fetch upstream '+refs/tags/*:refs/tags/*' '+refs/heads/release:refs/remotes/upstream/release'
+          git push origin --tags --force
