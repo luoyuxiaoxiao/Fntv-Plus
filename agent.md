@@ -51,6 +51,7 @@
 
 ### User Preferences
 <!-- 用户偏好与约定。例：- 提交信息一律使用中文 -->
+- 上游同步只手动不自动：2026-09-23 起三处 fork（本仓库、LiveAgent、ReinaManager）的 sync-upstream 定时任务全部关闭，只保留 workflow_dispatch；上游更新快、每次自动合都要修。手动同步入口即各仓库的 Sync Upstream workflow 手动触发。
 
 ### Project Facts
 <
