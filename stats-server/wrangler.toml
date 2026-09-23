@@ -1,0 +1,28 @@
+# Fntv-Plus 匿名统计 / 反馈服务端（Cloudflare Workers）
+# 部署步骤见同目录 README.md
+name = "fntv-stats"
+main = "worker.js"
+compatibility_date = "2026-09-18"
+workers_dev = true   # 保留 workers.dev 端点作备份（配了 routes 后 wrangler 默认会关掉它）
+
+# 自定义域名 → 统计接口走自有域名（国内比 workers.dev 稳）
+# ⚠ 必须是顶层键：放在任何 [[table]] 之后会被 TOML 归进那张表里（wrangler 会报
+#   "Unexpected fields found in r2_buckets[0] field: routes"），自定义域也就建不出来。
+routes = [
+  { pattern = "stats.690075.xyz", custom_domain = true }
+]
+
+# D1：存心跳与反馈元数据
+[[d1_databases]]
+binding = "DB"
+database_name = "fntv-stats"
+database_id = "39b66bd5-a309-4a86-963b-955f34ea5930"
+
+# R2：存反馈附带的日志正文（免费额度 10GB，够用很久）
+# 未启用 R2 时也没关系：日志会自动退回存进 D1 的 feedback.log 列（见 worker.js 说明）。
+[[r2_buckets]]
+binding = "LOGS"
+bucket_name = "fntv-stats-logs"
+
+# STATS_TOKEN 不要写在这里，用 secret：
+#   npx wrangler secret put STATS_TOKEN

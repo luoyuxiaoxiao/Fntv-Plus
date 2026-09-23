@@ -24,7 +24,7 @@ import { ipcRenderer } from 'electron';
 import { dlog, log } from '../log';
 import { S } from '../state';
 import { fnosGetEditDetail } from '../carousel/logo';
-import { extractTmdbId } from '../carousel/api';
+import { extractTmdbId, extractBangumiId } from '../carousel/api';
 import { DETAIL_HERO_SEL, findActiveDetailView } from './glass';
 
 const BTN_ID = 'fnos-epfix-btn';
@@ -87,6 +87,29 @@ export function epNumFromTitle(t: string): number | null {
     const m = s.match(/^第\s*(\d{1,4})\s*[集话話]/) || s.match(/^(?:Episode|EP\.?)\s*(\d{1,4})\b/i)
         || s.match(/^(?:第\s*)?(\d{1,4})$/);
     return m ? parseInt(m[1], 10) : null;
+}
+
+/** [lc-1178] 选集卡文本 → 集号（纯函数，验证脚本直测）。
+ *  fnOS 对元数据全空的集仍会在选集卡标题行渲染集号（真机截图实锤「8 夏日的回忆碎片」，
+ *  首文本节点就是「8」），所以卡内 <p> 的整串文本可解析出集号。 */
+export function parseCardNum(text: string): number | null {
+    const s = (text || '').trim();
+    const m = s.match(/^第\s*(\d{1,4})\s*[集话話]/) || s.match(/^(?:Episode|EP\.?)\s*(\d{1,4})\b/i)
+        || s.match(/^(\d{1,4})(?:\s|$)/);
+    return m ? parseInt(m[1], 10) : null;
+}
+
+/** [lc-1178] DOM 选集卡兜底集号：仅当 getEditDetail 无 index/title 且 item/list 无序号时调用
+ *  （每集一次 querySelector，不在渲染循环内）。找不到卡片（虚拟窗口未渲染）返回 null。 */
+export function epNumFromCard(epGuid: string): number | null {
+    const view = findActiveDetailView();
+    if (!view) return null;
+    const link = view.querySelector<HTMLAnchorElement>('a[href="/v/tv/episode/' + epGuid + '"]');
+    if (!link) return null;
+    const card = link.closest('[data-id="details"]') as HTMLElement | null;
+    const p = (link.querySelector('p') as HTMLElement | null)
+        || (card ? (card.querySelector('p') as HTMLElement | null) : null);
+    return parseCardNum((p && p.textContent) || '');
 }
 
 /** DOM 兜底解析季号（getEditDetail 没有 index_number 时用；只认数字/中文数字两种形态）。 */
@@ -287,6 +310,144 @@ export function patchEpisodeCard(epGuid: string, title: string | null, overview:
   }
 }
 
+// ── 季信息解析：多源刮削 + 多层级兜底 ─────────────────────────────────────────
+// [lc-1176] 根因（2026-09-17 实机日志取证）：飞牛用 **Bangumi 源** 刮削的条目，trim_id 形如
+//   `bg456080`，「季」级 item 的 getEditDetail 返回 `title:""` 且**不带任何 TMDB id** ——
+//   剧名与 TMDB id 只存在于父级「剧集」条目上，而季页 DOM 上明明完整显示着剧名。
+//   旧实现只认季自身两个字段，一遇 Bangumi 源就 100% 抛「无 TMDB id 且无标题，无法匹配」，
+//   用户侧表现为「TMDB 上明明有这部番，点了补全却说匹配不上」。
+// 现改为四级兜底：① 季自身（剥「第N季」后缀）→ ② 父级剧集 getEditDetail（真名 + TMDB id）
+//   → ③ 详情页 DOM 主标题（最大字号叶子）→ ④ document.title。
+//   另：bg 前缀识别出 Bangumi subject id，用于失败提示与日志定位（Bangumi 通道由 bgBackfill 负责）。
+
+/** 季信息解析结果。 */
+export interface SeasonMeta {
+  tmdbId: string;      // 可能为空（Bangumi 源条目）
+  bangumiId: string;   // Bangumi subject id（bg 前缀 trim_id），可能为空
+  title: string;       // 剧名（已剥季缀），可能为空（四级兜底全失败）
+  year: string;        // 首播年份，供 TMDB 搜索消歧，可能为空
+  seasonNumber: number | null;
+}
+
+/** 剥掉尾部季缀：「XXX 第2季」「XXX Season 2」「XXX S2」→「XXX」（TMDB 搜索不接受季号）。 */
+export function stripSeasonSuffix(t: string): string {
+  return String(t || '').trim()
+    .replace(/\s*(第\s*[0-9一二三四五六七八九十百]+\s*季|season\s*\d{1,3}|s\s*\d{1,3})\s*$/i, '')
+    .trim();
+}
+
+/** GET 飞牛 item 详情（父子链路探测用；非编辑态字段比 getEditDetail 更全）。 */
+async function fnosGet(origin: string, path: string): Promise<any | null> {
+  try {
+    const authx = await ipcRenderer.invoke('fnos-gen-authx', path).catch(() => '');
+    const resp = await fetch(origin + path, {
+      method: 'GET', credentials: 'include',
+      headers: authx ? { Authx: authx } : {},
+    });
+    if (!resp.ok) { dlog('[epBackfill] GET ' + path + ' HTTP ' + resp.status); return null; }
+    const j = await resp.json().catch(() => null);
+    if (!j || j.code !== 0) return null;
+    return j.data || null;
+  } catch (e: any) {
+    dlog('[epBackfill] GET ' + path + ' 异常 ' + String(e).substring(0, 80));
+    return null;
+  }
+}
+
+const GUID32 = /^[a-f0-9]{32}$/;
+
+/** 季 guid → 父级「剧集」guid：季详情 parent 系字段 → GET /v/api/v1/item/{guid} 再探。
+ *  [lc-1182] 导出供 tmdbCard.loadShowMeta 复用 —— 季层 title/tmdbId 双空时向上找剧集层
+ *  （与一级详情页同一条数据源，剧名一致 → 可命中主进程的「剧名→id」复用缓存）。 */
+export async function resolveSeriesGuid(origin: string, sg: string, seasonData: any): Promise<string | null> {
+  const pick = (d: any): string | null => {
+    if (!d) return null;
+    const c = d.parent_guid || d.parent_id || d.parent_item_guid || d.series_guid || d.show_guid
+      || (d.parent && d.parent.guid) || null;
+    const s = c == null ? '' : String(c);
+    return GUID32.test(s) ? s : null;
+  };
+  const direct = pick(seasonData);
+  if (direct) return direct;
+  const info = await fnosGet(origin, '/v/api/v1/item/' + sg);
+  const via = pick(info);
+  if (via) { dlog('[epBackfill] 父级剧集 guid 解析成功: ' + via); return via; }
+  if (info) dlog('[epBackfill] 季详情无 parent 系字段, keys=' + Object.keys(info || seasonData || {}).join(','));
+  return null;
+}
+
+/** DOM 兜底剧名：详情页 hero 内「字号最大的可见叶子文本」（主标题通常是最大号字），
+ *  再兜 document.title（形如「剧名 第1季 - 飞牛影视」）。
+ *  ⚠ 只在用户点按钮时调用一次，**绝不可进渲染循环**（内含 getComputedStyle）。 */
+export function showTitleFromDom(): string {
+  const isNoise = (t: string): boolean =>
+    !t || t.length < 2 || t.length > 60 || /飞牛影视|fnos/i.test(t)
+    || /^第\s*[0-9一二三四五六七八九十]+\s*季$/.test(t) || /^Season\s*\d+$/i.test(t)
+    || /^(选集|播放|收藏|已看|简介|详情)$/.test(t);
+  let best = '', bestSize = 0;
+  const view = findActiveDetailView();
+  if (view) {
+    const hero = view.querySelector(DETAIL_HERO_SEL);
+    const scope: Element = hero || view;
+    const leaves = scope.querySelectorAll('*');
+    const limit = Math.min(leaves.length, 1500);
+    for (let i = 0; i < limit; i++) {
+      const e = leaves[i] as HTMLElement;
+      if (e.children.length !== 0) continue;
+      const t = (e.textContent || '').trim();
+      if (isNoise(t)) continue;
+      const r = e.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) continue;
+      const size = parseFloat(getComputedStyle(e).fontSize) || 0;
+      if (size > bestSize) { bestSize = size; best = t; }
+    }
+  }
+  if (!best) {
+    const dt = String(document.title || '').replace(/[-–—|]\s*飞牛影视.*$/, '').trim();
+    const parts = dt.split(/\s*[-–—|]\s*/).map((p) => p.trim()).filter((p) => !isNoise(p));
+    best = parts.length ? parts.sort((a, b) => b.length - a.length)[0] : dt;
+  }
+  // CSS text-overflow 截断会带出尾部省略号 → 去掉，免得 TMDB 整句匹配失败
+  return stripSeasonSuffix(best.replace(/[…]+$|\.{2,}$/, '').trim());
+}
+
+/** 年份：仅取 item 自带字段（不扫 DOM，避免误抓页面其它四位数字）。 */
+function pickYear(d: any): string {
+  const raw = d && (d.year || d.production_year || d.first_air_date || d.premiere_date || d.air_date);
+  const m = String(raw || '').match(/(19\d{2}|20\d{2})/);
+  return m ? m[1] : '';
+}
+
+/** 季页完整 meta 解析（四级兜底）。抛错仅在 getEditDetail 彻底失败时。 */
+export async function resolveSeasonMeta(origin: string, sg: string): Promise<SeasonMeta> {
+  const data = await fnosGetEditDetail(origin, sg);
+  if (!data) throw new Error('读取季信息失败（getEditDetail）');
+  let tmdbId = extractTmdbId(data) || '';
+  let title = stripSeasonSuffix(String(data.title || data.name || '').trim());
+  let year = pickYear(data);
+  const bangumiId = extractBangumiId(data) || '';
+  const seasonNumber = numOrNull(data.index_number ?? data.index ?? data.season_number) ?? findSeasonNumberDom();
+
+  // ② 父级剧集：Bangumi 源把剧名/TMDB id 只放在剧集层
+  if (!title || !tmdbId || !year) {
+    const seriesGuid = await resolveSeriesGuid(origin, sg, data).catch(() => null);
+    if (seriesGuid) {
+      const sd = await fnosGetEditDetail(origin, seriesGuid).catch(() => null);
+      if (sd) {
+        if (!tmdbId) tmdbId = extractTmdbId(sd) || '';
+        if (!title) title = stripSeasonSuffix(String(sd.title || sd.name || '').trim());
+        if (!year) year = pickYear(sd);
+      }
+    }
+  }
+  // ③ DOM 主标题 ④ document.title（showTitleFromDom 内部已含）
+  if (!title) title = showTitleFromDom();
+
+  dlog('[epBackfill] 季 meta: title=' + JSON.stringify(title) + ' tmdb=' + (tmdbId || '-')
+    + ' bgm=' + (bangumiId || '-') + ' year=' + (year || '-') + ' S' + String(seasonNumber));
+  return { tmdbId, bangumiId, title, year, seasonNumber };
+}
+
 // ── 主流程 ──
 
 let _running = false;
@@ -305,22 +466,50 @@ async function runBackfill(btn: HTMLButtonElement): Promise<void> {
     if (btn.isConnected) setBtn(btn, '⏳ 补全中 ' + done + '/' + stats.total);
   };
   try {
-    // 1) 季 meta：tmdbId / 标题 / 季号（getEditDetail 真值优先，DOM 兜底）
-    const data = await fnosGetEditDetail(origin, guid);
-    if (!data) throw new Error('读取季信息失败（getEditDetail）');
-    const tmdbId = extractTmdbId(data) || '';
-    const title = String(data.title || data.name || '').trim();
-    const seasonNumber = numOrNull(data.index_number ?? data.index ?? data.season_number) ?? findSeasonNumberDom();
+    // 1) 季 meta：tmdbId / 标题 / 季号（[lc-1176] 四级兜底：季自身 → 父级剧集 → DOM → document.title）
+    const meta = await resolveSeasonMeta(origin, guid);
+    const tmdbId = meta.tmdbId;
+    const title = meta.title;
+    const seasonNumber = meta.seasonNumber;
     if (seasonNumber === null) throw new Error('无法确定季号（页面与元数据都没有）');
-    if (!tmdbId && !title) throw new Error('无 TMDB id 且无标题，无法匹配');
+    if (!tmdbId && !title) {
+      throw new Error(meta.bangumiId
+        ? '本季由 Bangumi 刮削(subject ' + meta.bangumiId + ')，仍取不到剧名，无法匹配'
+        : '无 TMDB id 且无标题，无法匹配');
+    }
 
-    // 2) TMDB 双语分集（7 天磁盘缓存 + SWR；失败 throw 不落盘）
+    // 2) [lc-1225] 先枚举本季集（item/list 为主，DOM 回落）—— 集数要作为 TMDB 季号对位的匹配线索
+    //   （飞牛季号来自番剧/Bangumi 计数而与 TMDB 分季不一致时，主进程在 404 后按集数/最近播出
+    //   自动对位实际季，见 tmdbSeasonResolve.ts；此前枚举在 TMDB 拉取之后，线索拿不到）
+    let episodes = await fnosEpisodeList(origin, guid).catch(() => [] as { guid: string; index: number | null }[]);
+    if (!episodes.length) episodes = episodeGuidsFromDom();
+    // [lc-1178] item/list 可能漏集（实测「本季大结局」未播集不返回：接口 11 集、页面 12 张卡）
+    //  → DOM 卡片比接口多时，把多出的 guid 并进来回填；集号由解析链的 epNumFromCard 兜底。
+    const domEps = episodeGuidsFromDom();
+    if (domEps.length > episodes.length) {
+        const have = new Set(episodes.map((e) => e.guid));
+        let merged = 0;
+        for (const d of domEps) if (!have.has(d.guid)) { episodes.push(d); merged++; }
+        if (merged) log('[epBackfill] item/list 比页面卡片少 ' + merged + ' 集, 已从 DOM 并入');
+    }
+    if (!episodes.length) throw new Error('未枚举到本季任何集（item/list 与 DOM 都为空）');
+    stats.total = episodes.length;
+
+    // 3) TMDB 双语分集（7 天磁盘缓存 + SWR；失败 throw 不落盘）
     setBtn(btn, '⏳ 获取 TMDB…');
     const r: any = await ipcRenderer.invoke('tmdb:season-episodes', {
       tmdbId: tmdbId || undefined, title: title || undefined, seasonNumber,
+      year: meta.year || undefined,   // [lc-1176] 年份消歧：同名条目取首播年最接近者
+      episodeCount: episodes.length,  // [lc-1225] 季号对位线索：整季集数唯一命中最可信
     });
     if (!r || !r.ok || !r.data || !Array.isArray(r.data.episodes)) {
-      throw new Error((r && r.error) || 'TMDB 获取失败');
+      throw new Error(((r && r.error) || 'TMDB 获取失败')
+        + (meta.bangumiId ? ('（本季 Bangumi subject ' + meta.bangumiId + '，可试「Bangumi 补全」）') : ''));
+    }
+    // [lc-1225] 主进程对位结果：飞牛第 N 季 → TMDB 实际季（无对位时两者相等）
+    const tmdbSeason = numOrNull(r.data.seasonNumber) ?? seasonNumber;
+    if (tmdbSeason !== seasonNumber) {
+      log('[epBackfill] 飞牛第 ' + seasonNumber + ' 季在 TMDB 不存在，已自动对位 TMDB 第 ' + tmdbSeason + ' 季');
     }
     const tmdbByNum = new Map<number, any>();
     // [多源刮削] 播出日期索引: 集号解析全失败时的兜底匹配(仅当该日期在 TMDB 唯一才采用)
@@ -331,7 +520,7 @@ async function runBackfill(btn: HTMLButtonElement): Promise<void> {
         if (ad) { const arr = tmdbByDate.get(ad) || []; arr.push(e); tmdbByDate.set(ad, arr); }
     }
 
-    // 2.5) [自定义刮削·v1.10.0] TVMaze 英文兜底（扩展数据源 ②，设置卡开关）：TMDB 缺英文（或整集
+    // 3.5) [自定义刮削·v1.10.0] TVMaze 英文兜底（扩展数据源 ②，设置卡开关）：TMDB 缺英文（或整集
     //    缺失）时，用 TVMaze 官方 API（免 Key，CC BY-SA）的英文标题/简介顶上。一次整季拉取 + 后端
     //    24h 缓存；查无此剧/未开启/网络失败都静默降级为纯 TMDB，绝不拖住主流程。
     const tvmazeByNum = new Map<number, { name: string; summary: string }>();
@@ -339,14 +528,14 @@ async function runBackfill(btn: HTMLButtonElement): Promise<void> {
       setBtn(btn, '⏳ 获取 TVMaze…');
       try {
         const tr: any = await ipcRenderer.invoke('tvmaze:show', {
-          title: title || undefined, tmdbId: tmdbId || undefined, seasonNumber,
+          title: title || undefined, tmdbId: tmdbId || undefined, seasonNumber: tmdbSeason,
         });
         if (tr && tr.ok && Array.isArray(tr.episodes)) {
           for (const e of tr.episodes) {
             const n = numOrNull(e.number);
             // TVMaze 未播出集常用占位名「TBD」，与「第 N 集」同性质按无数据处理
             const nm = (e.name && !/^tbd$/i.test(String(e.name).trim())) ? String(e.name) : '';
-            if (n !== null && numOrNull(e.season) === seasonNumber && (nm || e.summary)) {
+            if (n !== null && numOrNull(e.season) === tmdbSeason && (nm || e.summary)) {
               tvmazeByNum.set(n, { name: nm, summary: String(e.summary || '') });
             }
           }
@@ -357,12 +546,6 @@ async function runBackfill(btn: HTMLButtonElement): Promise<void> {
       }
     }
 
-    // 3) 飞牛枚举本季集（item/list 为主，DOM 回落）
-    let episodes = await fnosEpisodeList(origin, guid).catch(() => [] as { guid: string; index: number | null }[]);
-    if (!episodes.length) episodes = episodeGuidsFromDom();
-    if (!episodes.length) throw new Error('未枚举到本季任何集（item/list 与 DOM 都为空）');
-    stats.total = episodes.length;
-
     // 4) 逐集：读全量 → 裁决 → 写回 → 复核 → DOM 补丁
     let idx = 0;
     const worker = async (): Promise<void> => {
@@ -372,10 +555,13 @@ async function runBackfill(btn: HTMLButtonElement): Promise<void> {
                     const ed = await fnosGetEditDetail(origin, ep.guid);
                     if (!ed) { stats.failed++; tick(); continue; }
                     // [多源刮削] 集号解析链: fnOS 0.9.8 实测 getEditDetail/item/list 都不带 index_number
-                    //  (旧实现此处全 unmatched) → 补「标题『第 N 集』解析」与「播出日期唯一匹配」两级兜底
+                    //  (旧实现此处全 unmatched) → 补「标题『第 N 集』解析」「播出日期唯一匹配」与
+                    //  [lc-1178]「选集卡文本集号」三级兜底 —— Bangumi 源常出现 title/air_date 全空的空壳集
+                    //  (2026-09-17 实测 11 集中 6 集全空 → unmatched=6)，但 UI 卡片上始终渲染着集号。
                     const num = numOrNull(ed.index_number ?? ed.index ?? ed.episode_number)
                         ?? epNumFromTitle(String(ed.title ?? ed.name ?? ''))
-                        ?? ep.index;
+                        ?? ep.index
+                        ?? epNumFromCard(ep.guid);
                     let t = (num !== null) ? tmdbByNum.get(num) : undefined;
                     if (!t && ed.air_date) {
                         const byDate = tmdbByDate.get(String(ed.air_date));

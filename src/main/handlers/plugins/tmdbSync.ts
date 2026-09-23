@@ -10,6 +10,7 @@ import * as proxyModule from '../../../modules/proxyAgent';
 import * as logger from '../../../modules/logger';
 import { registerHandler } from '../core/ipcHandler';
 import { getDailyCached, DEFAULT_TTL_MS } from '../../common/dailyCache';
+import { pickFallbackSeason } from '../../common/tmdbSeasonResolve';
 
 const log = logger.component('tmdb');
 
@@ -691,6 +692,11 @@ const CREW_JOBS = {
         'Set Decoration', 'Costume Design', 'VFX Supervisor', '3D Director', 'CGI Director'],
 } as const;
 
+/** [lc-1181] 剧名 → TMDB id 的进程内缓存（跨路由复用；主进程常驻，随应用重启失效）。
+ *  只缓存「标题搜索解析出的 id」，有显式 tmdbId 时根本不走搜索，无需缓存。 */
+const _titleIdCache = new Map<string, { id: number; at: number }>();
+const TITLE_ID_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 function titleSlug(title: string): string {
     return crypto.createHash('md5').update(String(title || '')).digest('hex').slice(0, 12);
 }
@@ -732,8 +738,10 @@ async function tmdbSearchBest(
             { '，': ',', '、': ',', '；': ';', '：': ':', '！': '!', '？': '?', '—': '-', '…': '...', '・': '·', '･': '·' } as Record<string, string>
         )[c] || c)
         .replace(/　/g, ' ');
-    const doSearch = async (q: string, y?: string): Promise<any[]> => {
+    const doSearch = async (q: string, y?: string, noLang?: boolean): Promise<any[]> => {
         const p: any = { ...baseParams, query: q, page: 1 };
+        // [lc-1176] noLang：删掉 language 让 TMDB 按原始语言检索（见下方多语言兜底说明）
+        if (noLang) delete p.language;
         if (y) { if (mt === 'movie') p.year = y; else p.first_air_date_year = y; }
         const r = await getWithRetry(client, `/search/${mt}`, { params: p });
         return (r?.data?.results || []) as any[];
@@ -754,6 +762,20 @@ async function tmdbSearchBest(
     for (const q of queries) {
         const r = await tryQuery(q);
         if (r.length) { all = r; log.info('[TMDB][lc-947] 搜索命中 q=' + JSON.stringify(q) + ' results=' + r.length); break; }
+    }
+    // [lc-1176] 多语言兜底：TMDB 的 language 参数会让检索偏向该语言译名，新番/冷门条目常只有
+    //   日文原名或英文译名 → 拿中文剧名去搜 zh-CN 会 0 结果（用户观感：「TMDB 明明有这部却说匹配不上」）。
+    //   仅当上面全部策略都无果时，去掉 language 再试一轮（TMDB 此时按原始语言返回，能命中原文条目）。
+    //   只在原本就会失败的路径上多发请求，成功路径零额外开销。
+    if (!all.length) {
+        for (const q of queries.slice(0, 2)) {
+            const r = await doSearch(q, undefined, true).catch(() => [] as any[]);
+            if (r.length) {
+                all = r;
+                log.info('[TMDB][lc-1176] 无语言搜索命中 q=' + JSON.stringify(q) + ' results=' + r.length);
+                break;
+            }
+        }
     }
     if (!all.length) { log.warn('[TMDB][lc-947] 搜索无果 title=' + JSON.stringify(title)); return null; }
     const y = parseInt(String(year || '').slice(0, 4), 10);
@@ -783,8 +805,22 @@ async function resolveShowId(
     // [lc-945] 去掉标题尾部「第N季 / Season N / S01」等季号，避免污染 TMDB 搜索(季号由 seasonNumber 单独传)
     title = title.replace(/\s*(第\s*[0-9一二三四五六七八九十百]+\s*季|season\s*\d{1,3}|s\s*\d{1,3})\s*$/i, '').trim();
     if (!title) return null;
+    // [lc-1181] 跨路由复用「剧名 → TMDB id」：详情缓存 key 带季号后缀(show_v2_tv_<slug>_s1 / _sx)，
+    //   同一部剧在**一级页与季页各搜一次**。译名与飞牛/Bangumi 刮削名有出入时（实机：飞牛「…打垮祖国～」
+    //   对 TMDB「…碾碎祖国～」，一字之差）季页会搜不到，而一级页刚解析成功过 —— 用户观感
+    //   「一级详情页有数据，二级页刷新却说不存在」。这里把已解析的 id 按剧名缓存起来，
+    //   后续同名词条（不论哪个页面/季号）直接复用，不再各自重搜。
+    //   force 刷新同样复用：它只省掉一次搜索，详情/分集数据仍按 force 重新拉取。
+    const idCacheKey = mt + '_' + titleSlug(title);
+    const hit = _titleIdCache.get(idCacheKey);
+    if (hit && (Date.now() - hit.at) < TITLE_ID_TTL_MS) {
+        log.info('[TMDB][lc-1181] 复用已解析 id ' + hit.id + ' ← "' + title + '"');
+        return hit.id;
+    }
     const best = await tmdbSearchBest(client, baseParams, mt, title, arg.year);
-    return best ? best.id : null;
+    const id = best ? best.id : null;
+    if (id != null) _titleIdCache.set(idCacheKey, { id, at: Date.now() });
+    return id;
 }
 
 /** 归一化 TMDB 详情 + append_to_response 的多个子响应为「剧集信息」渲染所需的扁平结构 */
@@ -1014,7 +1050,24 @@ async function fetchShowDetails(arg: {
                 const sResp = await getWithRetry(client, `/tv/${id}/season/${arg.seasonNumber}`, { params: baseParams });
                 season = normalizeSeason(sResp?.data || null, arg.seasonNumber);
             } catch (e: any) {
-                log.warn('[TMDB] 季详情获取失败（season=' + arg.seasonNumber + '）：' + String(e?.message || e));
+                // [lc-1225] 飞牛季号与 TMDB 分季不一致（如「爱书的下克上」飞牛第4季 = TMDB S2）时
+                //   /tv/{id}/season/{n} 404。用主请求已带回来的 seasons 列表自动对位实际季，零额外搜索。
+                if ((e && e.response && e.response.status) === 404) {
+                    const fb = pickFallbackSeason(dResp?.data?.seasons, arg.seasonNumber);
+                    if (fb !== null) {
+                        try {
+                            const sResp = await getWithRetry(client, `/tv/${id}/season/${fb}`, { params: baseParams });
+                            season = normalizeSeason(sResp?.data || null, fb);
+                            log.info('[TMDB][lc-1225] 第 ' + arg.seasonNumber + ' 季在 TMDB 不存在(404)，'
+                                + '剧集信息卡已对位第 ' + fb + ' 季');
+                        } catch (e2: any) {
+                            log.warn('[TMDB] 对位季（season=' + fb + '）获取失败：' + dumpErr(e2));
+                        }
+                    }
+                }
+                if (!season) {
+                    log.warn('[TMDB] 季详情获取失败（season=' + arg.seasonNumber + '）：' + String(e?.message || e));
+                }
             }
         }
         log.info('[TMDB] 详情获取成功：' + mt + '/' + id + ' ' + (arg.title || '') + (season ? (' 含第' + arg.seasonNumber + '季') : ''));
@@ -1124,7 +1177,7 @@ function init(): void {
     //   缓存 7 天（getDailyCached 内置 SWR：过期先秒回旧值后台静默刷新）；重拉由 force 驱动。
     registerHandler('tmdb:season-episodes', async (_e: any, arg: {
         tmdbId?: string | number; title?: string; year?: string;
-        seasonNumber?: number | null; force?: boolean;
+        seasonNumber?: number | null; episodeCount?: number; force?: boolean;
     }) => {
         const sn = typeof arg?.seasonNumber === 'number' && arg.seasonNumber >= 0 ? arg.seasonNumber : null;
         if (sn === null) return { ok: false, error: '缺少季号，无法定位 TMDB 分季。' };
@@ -1138,37 +1191,60 @@ function init(): void {
                 tmdbId: arg?.tmdbId, title: arg?.title, year: arg?.year,
             });
             if (!id) return { ok: false, error: 'TMDB 未找到匹配条目：' + (arg?.title || arg?.tmdbId || '(无标题)') };
-            const cacheKey = 'season_eps_v1_' + id + '_s' + sn;
+            const cacheKey = 'season_eps_v2_' + id + '_s' + sn;
             const r = await getDailyCached(cacheKey, async () => {
-                const pull = async (lang: string): Promise<any[]> => {
-                    const resp = await getWithRetry(client, `/tv/${id}/season/${sn}`, { params: { ...baseParams, language: lang } });
+                const pull = async (lang: string, season: number): Promise<any[]> => {
+                    const resp = await getWithRetry(client, `/tv/${id}/season/${season}`, { params: { ...baseParams, language: lang } });
                     return Array.isArray(resp?.data?.episodes) ? resp.data.episodes : [];
                 };
-                // 双语两次请求并行；zh 缺翻译时 TMDB 回落英文原文 → 渲染端按 CJK 检测降级使用
-                const [zhEps, enEps] = await Promise.all([pull('zh-CN'), pull('en-US')]);
+                // [lc-1225] 飞牛季号常来自番剧/Bangumi 计数，与 TMDB 分季不一致（实锤：爱书的下克上
+                //   飞牛「第 4 季」= TMDB S2「领主的养女」），直取 /season/{n} 必 404。此处自动对位：
+                //   episodeCount（渲染端传的本季实际集数）唯一命中优先，否则取最近播出的季。
+                //   缓存按「请求季」为键，命中后不再反复探测；对位结果随 payload 下发。
+                let effSn = sn;
+                try {
+                    const [zhEps, enEps] = await Promise.all([pull('zh-CN', sn), pull('en-US', sn)]);
+                    return { effSn, zhEps, enEps };
+                } catch (e: any) {
+                    if ((e && e.response && e.response.status) !== 404) throw e;
+                    const tvResp = await getWithRetry(client, `/tv/${id}`, { params: baseParams });
+                    const fb = pickFallbackSeason(tvResp?.data?.seasons, sn, arg?.episodeCount);
+                    if (fb === null) throw e;   // 无候选可对位 → 维持原 404 语义
+                    log.info('[TMDB][lc-1225] 第 ' + sn + ' 季在 TMDB 不存在(404)，自动对位第 ' + fb + ' 季'
+                        + (arg?.episodeCount ? ('（本地 ' + arg.episodeCount + ' 集）') : ''));
+                    const [zhEps, enEps] = await Promise.all([pull('zh-CN', fb), pull('en-US', fb)]);
+                    effSn = fb;
+                    return { effSn, zhEps, enEps };
+                }
+            }, TMDB_SEASON_EPS_TTL_MS, !!arg?.force).then((rr: any) => {
+                // getDailyCached 缓存的是 fetcher 返回值本身 —— 这里把 {effSn,zhEps,enEps} 归一成对外 payload
                 const enByNum = new Map<number, any>();
-                for (const e of enEps) {
+                for (const e of (rr.enEps || [])) {
                     if (e && typeof e.episode_number === 'number') enByNum.set(e.episode_number, e);
                 }
                 return {
-                    showTmdbId: id,
-                    seasonNumber: sn,
-                    episodes: zhEps
-                        .filter((e: any) => e && typeof e.episode_number === 'number')
-                        .map((e: any) => {
-                            const en = enByNum.get(e.episode_number) || null;
-                            return {
-                                episodeNumber: e.episode_number,
-                                nameZh: typeof e.name === 'string' ? e.name : '',
-                                overviewZh: typeof e.overview === 'string' ? e.overview : '',
-                                nameEn: en && typeof en.name === 'string' ? en.name : '',
-                                overviewEn: en && typeof en.overview === 'string' ? en.overview : '',
-                                // [多源刮削] 播出日期: 集号解析全失败时按「日期唯一匹配」兜底对位(epBackfill 用)
-                                airDate: typeof e.air_date === 'string' ? e.air_date : '',
-                            };
-                        }),
+                    ...rr,
+                    data: {
+                        showTmdbId: id,
+                        seasonNumber: rr.effSn,
+                        requestedSeasonNumber: sn,
+                        episodes: (rr.zhEps || [])
+                            .filter((e: any) => e && typeof e.episode_number === 'number')
+                            .map((e: any) => {
+                                const en = enByNum.get(e.episode_number) || null;
+                                return {
+                                    episodeNumber: e.episode_number,
+                                    nameZh: typeof e.name === 'string' ? e.name : '',
+                                    overviewZh: typeof e.overview === 'string' ? e.overview : '',
+                                    nameEn: en && typeof en.name === 'string' ? en.name : '',
+                                    overviewEn: en && typeof en.overview === 'string' ? en.overview : '',
+                                    // [多源刮削] 播出日期: 集号解析全失败时按「日期唯一匹配」兜底对位(epBackfill 用)
+                                    airDate: typeof e.air_date === 'string' ? e.air_date : '',
+                                };
+                            }),
+                    },
                 };
-            }, TMDB_SEASON_EPS_TTL_MS, !!arg?.force);
+            });
             log.info('[TMDB] 季分集' + (r.fromCache ? '来自磁盘缓存(未请求TMDB)' : '已向TMDB刷新') + ' key=' + cacheKey
                 + ' eps=' + ((r.data && r.data.episodes && r.data.episodes.length) || 0));
             return { ok: true, data: r.data, fetchedAt: r.fetchedAt, fromCache: r.fromCache };

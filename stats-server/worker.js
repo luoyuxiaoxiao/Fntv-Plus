@@ -1,0 +1,268 @@
+/**
+ * Fntv-Plus —— 匿名统计 / 反馈接收端（Cloudflare Worker，单文件）
+ *
+ * 隐私底线（改代码时请一并遵守）：
+ *  1. 不读、不存、不打日志任何 IP（request.headers 里的 cf-connecting-ip / x-forwarded-for 一律不碰）。
+ *  2. 不读 User-Agent。
+ *  3. /ping 只接收 4 个字段：匿名 ID、版本号、系统、架构 + 日期；多余字段一律丢弃。
+ *  4. 按 (匿名ID, 日期) 主键去重 —— 只能聚合出「人数」，无法还原个体行为轨迹。
+ *  5. /stats 需要 token，不对外公开。
+ *
+ * 绑定：DB（D1）、LOGS（R2，存反馈附带日志）、STATS_TOKEN（secret）
+ */
+
+const corsHeaders = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-headers': 'content-type',
+  'access-control-allow-methods': 'POST,GET,OPTIONS',
+};
+
+function json(data, status = 200, extra = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { ...corsHeaders, 'content-type': 'application/json; charset=utf-8', ...extra },
+  });
+}
+
+const RE_AID = /^[0-9a-fA-F-]{8,64}$/;
+const RE_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+function clamp(str, max) {
+  return typeof str === 'string' ? str.slice(0, max) : '';
+}
+
+/**
+ * 只接受今天 ±7 天的日期。
+ * 放宽到 7 天是为了支持「补报」：用户网络连不上服务端时客户端会把当天记下来，
+ * 等网络恢复后连同前几天一起补发，这样统计到的活跃人数不会因为偶发断网而偏低。
+ */
+function dayPlausible(day) {
+  if (!RE_DAY.test(day)) return false;
+  const diff = Math.abs(Date.now() - Date.parse(day + 'T00:00:00Z')) / 86400000;
+  return diff <= 7;
+}
+
+export default {
+  async fetch(request, env) {
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders });
+
+    const url = new URL(request.url);
+
+    if (url.pathname === '/ping' && request.method === 'POST') return handlePing(request, env);
+    if (url.pathname === '/feedback' && request.method === 'POST') return handleFeedback(request, env);
+    if (url.pathname === '/visit' && request.method === 'POST') return handleVisit(request, env);
+    if (url.pathname === '/visit/total' && request.method === 'GET') return handleVisitTotal(url, env);
+    if (url.pathname === '/stats' && request.method === 'GET') return handleStats(url, env);
+    if (url.pathname === '/stats/feedback' && request.method === 'GET') return handleStatsFeedback(url, env);
+    if (url.pathname === '/stats/log' && request.method === 'GET') return handleStatsLog(url, env);
+
+    // 根路径健康检查：便于探活/自检（不返回任何用户数据）
+    if (url.pathname === '/' || url.pathname === '') {
+      return json({ ok: true, service: 'fntv-stats', d1: !!env.DB, r2: !!env.LOGS, time: new Date().toISOString() });
+    }
+
+    return json({ error: 'not found' }, 404);
+  },
+};
+
+/** 官网访问计数：每次页面加载 +1 PV；body.nv=1 表示该浏览器首次到访，再 +1 UV。
+ *  只聚合成 visit 表里的天级数字 —— 不存 IP、不存任何 ID，与 /ping 同一套隐私底线。 */
+function cnDay() {
+  return new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);   // UTC+8
+}
+
+async function visitNums(env) {
+  const day = cnDay();
+  try {
+    const [all, td] = await Promise.all([
+      env.DB.prepare('SELECT COALESCE(SUM(pv),0) AS pv, COALESCE(SUM(uv),0) AS uv FROM visit').first(),
+      env.DB.prepare('SELECT pv, uv FROM visit WHERE day = ?').bind(day).first(),
+    ]);
+    return { pv: all.pv, uv: all.uv, today: td ? td.pv : 0, uvToday: td ? td.uv : 0 };
+  } catch (e) {
+    return { pv: 0, uv: 0, today: 0, uvToday: 0 };
+  }
+}
+
+async function handleVisit(request, env) {
+  let nv = 0;
+  try {
+    const body = await request.json();
+    nv = body && body.nv === 1 ? 1 : 0;
+  } catch { /* 无 body 也算一次 PV */ }
+  const day = cnDay();
+  const upsert = 'INSERT INTO visit (day, pv, uv) VALUES (?, 1, ?) ' +
+    'ON CONFLICT(day) DO UPDATE SET pv = pv + 1, uv = uv + excluded.uv';
+  try {
+    await env.DB.prepare(upsert).bind(day, nv).run();
+  } catch (e) {
+    try {
+      // 老库还没建 visit 表：建表后重试一次
+      await env.DB.exec('CREATE TABLE IF NOT EXISTS visit (day TEXT PRIMARY KEY, pv INTEGER NOT NULL DEFAULT 0, uv INTEGER NOT NULL DEFAULT 0)');
+      await env.DB.prepare(upsert).bind(day, nv).run();
+    } catch (e2) {
+      return json({ error: 'db error' }, 500);
+    }
+  }
+  return json({ ok: true, ...(await visitNums(env)) });
+}
+
+/** 官网访问数（公开 —— 只有聚合数字，无需 token）：GET /visit/total */
+async function handleVisitTotal(url, env) {
+  return json({ ok: true, ...(await visitNums(env)) });
+}
+
+/** 客户端每天一次的匿名心跳 */
+async function handlePing(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'bad json' }, 400);
+  }
+  const aid = clamp(body.aid, 64);
+  // days 支持数组（补报多天）；d 为兼容旧客户端的单日字段
+  const days = Array.isArray(body.days)
+    ? body.days.slice(0, 8).map((d) => clamp(String(d), 10)).filter((d) => RE_DAY.test(d))
+    : [clamp(body.d, 10)];
+  const valid = days.filter((d) => dayPlausible(d));
+  if (!RE_AID.test(aid) || valid.length === 0) return json({ error: 'bad payload' }, 400);
+
+  const ver = clamp(body.v, 32);
+  const os = clamp(body.os, 16);
+  const arch = clamp(body.arch, 16);
+
+  try {
+    // 同一天重复上报直接忽略 —— 这是「人数」而非「次数」的关键
+    await env.DB.batch(valid.map((day) => env.DB.prepare(
+      'INSERT OR IGNORE INTO ping (aid, day, ver, os, arch) VALUES (?, ?, ?, ?, ?)'
+    ).bind(aid, day, ver, os, arch)));
+  } catch (e) {
+    return json({ error: 'db error' }, 500);
+  }
+  return json({ ok: true, days: valid.length });
+}
+
+/** Bug 反馈（含可选日志正文） */
+async function handleFeedback(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'bad json' }, 400);
+  }
+  const message = clamp(body.message, 4000).trim();
+  if (!message) return json({ error: 'empty message' }, 400);
+  const contact = clamp(body.contact, 200);
+  const logText = typeof body.log === 'string' ? body.log.slice(0, 3 * 1024 * 1024) : '';
+  const aid = RE_AID.test(clamp(body.aid, 64)) ? clamp(body.aid, 64) : '';
+
+  const id = crypto.randomUUID();
+  const ts = new Date().toISOString();
+  const hasLog = logText ? 1 : 0;
+
+  // 日志优先存 R2（不占数据库）；**没有 R2 时退回存 D1** —— 新账号启用 R2 可能要绑支付方式，
+  // 为一个日志桶不值当，D1 免费 5GB 也完全够（几十条日志才几十 MB）。
+  const useR2 = hasLog && !!env.LOGS;
+  const d1Log = !useR2 && hasLog ? logText.slice(0, 800 * 1024) : '';
+
+  try {
+    if (useR2) {
+      await env.LOGS.put(`logs/${id}.log`, logText, {
+        httpMetadata: { contentType: 'text/plain; charset=utf-8' },
+      });
+    }
+    await env.DB.prepare(
+      'INSERT INTO feedback (id, ts, aid, ver, os, arch, contact, has_log, log, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(id, ts, aid, clamp(body.v, 32), clamp(body.os, 16), clamp(body.arch, 16), contact, hasLog, d1Log, message).run();
+  } catch (e) {
+    return json({ error: 'db error' }, 500);
+  }
+  return json({ ok: true, id });
+}
+
+/** 作者查看统计：/stats?token=xxx */
+async function handleStats(url, env) {
+  if (!env.STATS_TOKEN || url.searchParams.get('token') !== env.STATS_TOKEN) {
+    return json({ error: 'forbidden' }, 403);
+  }
+  const day = (offsetDays) => {
+    const d = new Date(Date.now() - offsetDays * 86400000);
+    return d.toISOString().slice(0, 10);
+  };
+  const [total, d1, d7, d30, daily, versions, systems, fb, recent] = await Promise.all([
+    env.DB.prepare('SELECT COUNT(DISTINCT aid) AS c FROM ping').first(),
+    env.DB.prepare('SELECT COUNT(DISTINCT aid) AS c FROM ping WHERE day >= ?').bind(day(0)).first(),
+    env.DB.prepare('SELECT COUNT(DISTINCT aid) AS c FROM ping WHERE day >= ?').bind(day(6)).first(),
+    env.DB.prepare('SELECT COUNT(DISTINCT aid) AS c FROM ping WHERE day >= ?').bind(day(29)).first(),
+    env.DB.prepare('SELECT day, COUNT(DISTINCT aid) AS c FROM ping WHERE day >= ? GROUP BY day ORDER BY day')
+      .bind(day(29)).all(),
+    env.DB.prepare('SELECT ver, COUNT(DISTINCT aid) AS c FROM ping GROUP BY ver ORDER BY c DESC LIMIT 10').all(),
+    env.DB.prepare('SELECT os, COUNT(DISTINCT aid) AS c FROM ping GROUP BY os ORDER BY c DESC').all(),
+    env.DB.prepare('SELECT COUNT(*) AS c FROM feedback').first(),
+    env.DB.prepare(
+      'SELECT id, ts, ver, os, has_log, substr(message, 1, 160) AS msg FROM feedback ORDER BY ts DESC LIMIT 50'
+    ).all(),
+  ]);
+
+  const visits = await visitNums(env);
+  return json({
+    ok: true,
+    users: { total: total.c, today: d1.c, last7: d7.c, last30: d30.c },
+    daily: daily.results,
+    versions: versions.results,
+    systems: systems.results,
+    feedbackCount: fb.c,
+    recentFeedback: recent.results,
+    visits: visits,
+  });
+}
+
+/** 作者查看单条反馈的完整内容：/stats/feedback?id=xxx&token=yyy
+ *  （官网后台管理面板用；/stats 列表里只有 160 字摘要） */
+async function handleStatsFeedback(url, env) {
+  if (!env.STATS_TOKEN || url.searchParams.get('token') !== env.STATS_TOKEN) {
+    return json({ error: 'forbidden' }, 403);
+  }
+  const id = String(url.searchParams.get('id') || '');
+  if (!/^[0-9a-fA-F-]{8,64}$/.test(id)) return json({ error: 'bad id' }, 400);
+  try {
+    const row = await env.DB.prepare(
+      'SELECT id, ts, aid, ver, os, arch, contact, has_log, message FROM feedback WHERE id = ?'
+    ).bind(id).first();
+    if (!row) return json({ error: 'not found' }, 404);
+    return json({ ok: true, feedback: row });
+  } catch (e) {
+    return json({ error: 'db error' }, 500);
+  }
+}
+
+/** 作者下载某条反馈附带的日志：/stats/log?id=xxx&token=yyy */
+async function handleStatsLog(url, env) {
+  if (!env.STATS_TOKEN || url.searchParams.get('token') !== env.STATS_TOKEN) {
+    return json({ error: 'forbidden' }, 403);
+  }
+  const id = String(url.searchParams.get('id') || '');
+  if (!/^[0-9a-fA-F-]{8,64}$/.test(id)) return json({ error: 'bad id' }, 400);
+
+  // 1) D1 里的日志（无 R2 时的存放处）
+  try {
+    const row = await env.DB.prepare('SELECT log FROM feedback WHERE id = ?').bind(id).first();
+    if (row && row.log) {
+      return new Response(row.log, {
+        headers: { ...corsHeaders, 'content-type': 'text/plain; charset=utf-8' },
+      });
+    }
+  } catch (_) { /* 老表没有 log 列，忽略 */ }
+
+  // 2) R2 里的日志（启用了 R2 时的存放处）
+  if (env.LOGS) {
+    const obj = await env.LOGS.get(`logs/${id}.log`);
+    if (obj) {
+      return new Response(await obj.text(), {
+        headers: { ...corsHeaders, 'content-type': 'text/plain; charset=utf-8' },
+      });
+    }
+  }
+  return json({ error: 'not found' }, 404);
+}

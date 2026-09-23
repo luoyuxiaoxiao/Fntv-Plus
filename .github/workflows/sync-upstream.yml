@@ -1,12 +1,11 @@
 name: Sync Upstream
 
-# 定时把 YDMY007/Fntv-Plus 的 release 合并到本 fork main（merge 而非 reset，
+# 手动把 YDMY007/Fntv-Plus 的 release 合并到本 fork main（merge 而非 reset，
 # fork 自有文件如 arch-package.yml 不会被上游覆盖丢失）。
 # 上游默认分支是 release（main 在上游不存在），故跟踪 release。
+# 2026-09-23 起取消定时同步（上游更新快、每次合都要修），改手动触发。
 # 同步冲突时 job 失败并保留现场，需人工手动 merge 后 push。
 on:
-  schedule:
-    - cron: "29 3 * * *" # 每天 03:29 UTC，避开整点高峰
   workflow_dispatch:
 
 permissions:
@@ -30,6 +29,9 @@ jobs:
           # 用 + 强制按上游为准更新（上游是版本真相源）。
           git fetch upstream '+refs/tags/*:refs/tags/*' '+refs/heads/release:refs/remotes/upstream/release'
           git checkout main
+          # merge commit 需要身份；checkout 不自带，需显式设置，否则非快进合并直接失败。
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # 快进则快进，否则 merge（保留 fork 自有改动）；冲突即失败，人工处理。
           git merge --no-edit upstream/release || {
             echo "CONFLICT: upstream 与 fork 改动冲突，需人工手动 merge 后 push。"

@@ -12,6 +12,7 @@ import { dlog, log } from '../log';
 import { fnosGetEditDetail } from '../carousel/logo';
 import { extractTmdbId } from '../carousel/api';
 import { DETAIL_HERO_SEL, findActiveDetailView } from './glass';
+import { resolveSeriesGuid } from './epBackfill';
 
 const CARD_ID = 'fnos-beautify-tmdb-card';
 
@@ -318,8 +319,10 @@ async function loadShowMeta(): Promise<{ guid: string; title: string; year: stri
   if (!page) return null;
   if (_tmdbMetaCache && _tmdbMetaCache.guid === page.guid) return _tmdbMetaCache;
   let title = '', year = '', tmdbId = '';
+  let seasonData: any = null;
   try {
     const data = await fnosGetEditDetail(location.origin, page.guid);
+    seasonData = data;
     if (data) {
       title = String(data.title || data.name || '').trim();
       if (_isSysTitle(title)) title = '';
@@ -334,6 +337,33 @@ async function loadShowMeta(): Promise<{ guid: string; title: string; year: stri
     }
   } catch (e) {
     dlog('[lc-980] getEditDetail 失败, 退回页面解析: ' + String(e).substring(0, 60));
+  }
+  // [lc-1182] 父级剧集兜底（先于 DOM）：Bangumi 源条目的季层 title 恒空、无 TMDB id（lc-1176 同源问题，
+  //  实机复现「(无标题)」→ TMDB 直接放弃），而 DOM 兜底依赖渲染时机时灵时不灵。父级剧集层与
+  //  **一级详情页是同一条数据**，剧名必然一致 —— 拿到它既能让搜索命中，还能命中主进程
+  //  lc-1181 的「剧名→id」复用缓存（一级页解析过就直接复用 id，正是用户要的"一级页有就复用"）。
+  if ((!title || !tmdbId) && !_isOneLevel()) {
+    try {
+      const seriesGuid = await resolveSeriesGuid(location.origin, page.guid, seasonData);
+      if (seriesGuid) {
+        const sd = await fnosGetEditDetail(location.origin, seriesGuid);
+        if (sd) {
+          if (!tmdbId) tmdbId = extractTmdbId(sd) || '';
+          if (!title) {
+            const st = String(sd.title || sd.name || '').trim();
+            if (!_isSysTitle(st)) title = st;
+          }
+          if (!year) {
+            const yRaw = sd.year || sd.production_year || sd.first_aired || sd.premiere_date || '';
+            const ym = String(yRaw).match(/(\d{4})/);
+            if (ym) year = ym[1];
+          }
+          dlog('[lc-1182] 季 meta 父级剧集兜底: guid=' + seriesGuid + ' title=' + JSON.stringify(title) + ' tmdb=' + (tmdbId || '-'));
+        }
+      }
+    } catch (e2) {
+      dlog('[lc-1182] 父级剧集兜底失败(忽略): ' + String(e2).substring(0, 60));
+    }
   }
   if (!title) title = findSeasonShowTitle();
   if (!year) year = findSeasonYearText().replace(/\D/g, '').slice(0, 4);
@@ -816,19 +846,135 @@ function openStillLightbox(startIdx: number): void {
  *  · [lc-1010] Series 一级页：内容面板(SERIES_PANEL_SEL，col.children[1])本身 —— 卡由 N8b 段
  *    绝对定位到面板右列，宿主只提供挂载点。settle 那一刻面板可能未渲染 → 返回 null，
  *    由 _renderCard() 在 fetch resolve 后重试(与季页竞态同一自愈路径)。 */
+const FALLBACK_HOST_MARK = 'data-fnos-card-host';
+/** [lc-1185] 补挂节流：同一 pathname 的补挂次数（防与 React 互相删除时死循环空转）。 */
+let _remountKey = '';
+let _remountCount = 0;
+
+/** [lc-1190] col 内自建宿主 + **同步保活**（取代 lc-1186/1187 的浮动定位方案）。
+ *  背景（血泪史 lc-1180~1189）：季页右栏 = col 的第 3 个子节点，由 beautifyStyle 的 grid
+ *  定位到右侧 40% 栏。无演职人员区的条目（Bangumi 源常见）没有这个节点，而**自建的兄弟节点会被
+ *  React 重建 col 子节点时摘掉**（实机诊断：children 里始终没有自建宿主），此前用「延迟 200ms
+ *  补挂」只能闪烁式挣扎。★ 正解：在 MutationObserver 的**微任务**里把**同一个节点**放回原位 ——
+ *  React 的摘除与我们的重插都发生在同一次渲染之前，视觉上完全无感；节点自身有引用，内容不丢。
+ *  （浮动定位虽然稳，但卡片不占文档流、右列空着、滚动表现也不同 —— 用户明确要"和正常的那样"。） */
+let _colHost: HTMLElement | null = null;       // 自建的 col 内宿主
+let _colHostCol: HTMLElement | null = null;
+let _colHostObs: MutationObserver | null = null;
+let _colHostLastPut = 0;                       // [lc-1192] 补插节流（防与 React 互删时微任务风暴卡死主线程）
+
+function _armColHostGuard(col: HTMLElement): void {
+  if (_colHostCol === col && _colHostObs) return;
+  if (_colHostObs) _colHostObs.disconnect();
+  _colHostCol = col;
+  _colHostObs = new MutationObserver(() => {
+    const h = _colHost;
+    if (!h || !col.isConnected) return;
+    if (!h.firstChild) {                           // 卡已被搬走/移除 → 宿主没用了，就地回收
+      if (h.parentNode) h.parentNode.removeChild(h);
+      _colHost = null;
+      return;
+    }
+    if (h.parentNode === col) return;              // 还在 col 里 → 收工
+    // [lc-1192] ⚠ 只做 **appendChild 追加**，绝不用 insertBefore 抢位置：
+    //  lc-1191 的「强制纠正到 :nth-child(3)」与 React 的子节点排序互相冲突 —— 双方都是同步
+    //  DOM 操作 + 各自触发新的 Mutation → 微任务风暴 → 主线程卡死（用户实测打开季页即死）。
+    //  位置交由 CSS 显式 grid-area 指定（beautifyStyle 新增 [data-fnos-card-host] 规则），
+    //  顺序谁先谁后都无所谓，双方不再争抢同一资源。
+    const now = Date.now();
+    if (now - _colHostLastPut < 100) return;       // 100ms 节流
+    _colHostLastPut = now;
+    col.appendChild(h);
+  });
+  _colHostObs.observe(col, { childList: true });
+}
+
+/** 取/建 col 内的自建右栏宿主：**appendChild 追加到 col 末尾**（绝不插队），
+ *  grid 右列位置由 beautifyStyle 的 [data-fnos-card-host] 显式规则指定。 */
+function _ensureColHost(col: HTMLElement): HTMLElement {
+  _armColHostGuard(col);
+  if (_colHost) {
+    if (_colHost.parentNode !== col) col.appendChild(_colHost);
+    return _colHost;
+  }
+  const h = document.createElement('div');
+  h.setAttribute(FALLBACK_HOST_MARK, '1');
+  _colHost = h;
+  col.appendChild(h);
+  dlog('[lc-1192] 季页无原生右栏(演职人员区未渲染), 自建 col 内右栏宿主(尾插+CSS 定位)');
+  return h;
+}
+
+/** [lc-1189] 原生「IMDB/豆瓣链接块」的特征类（与 beautifyStyle I 段的隐藏规则同源判据）。
+ *  ⚠ 它**绝不能当卡片宿主**：只是外链行，不是信息栏。此前按"可见性"判定时，若该块因
+ *  没有 imdb/tmdb 外链而未被 CSS 隐藏（display:block），就会被误判成可用右栏，卡被挂进去后
+ *  恒为 0×0（实机：children[2]=DIV[box-border w-full px-[46px]]{block}，重建 5 次全失败）。 */
+const LINK_BLOCK_RE = /px-\[46px\]/;
+
+/** 已知不适合承载卡片的**原生**宿主（运行时探测）：某个原生宿主让卡量到零尺寸就拉黑，
+ *  后续一律改走 col 内自建宿主 —— 结构变化时的自动降级，避免"选了坏宿主 → 重建 → 还是坏宿主"的死循环。 */
+const _badHosts = new WeakSet<Element>();
+
+/** [lc-1188] 季页「首选原生宿主」判定（**无副作用**，不建自建宿主）：
+ *  第 3 个子节点存在、不是什么链接块、不是自建宿主、可见、且没被拉黑 → 就是它；否则 null。
+ *  单独抽出来的理由：`ensureTmdbCard` 要判断"卡是否待在正确宿主里"，不能顺手把宿主建出来。 */
+function _preferredNativeHost(): HTMLElement | null {
+  if (_isOneLevel()) return null;
+  const hero = _activeHero();
+  const col = hero ? hero.parentElement : null;
+  if (!col) return null;
+  const third = (col.children[2] as HTMLElement) || null;
+  if (!third || third.hasAttribute(FALLBACK_HOST_MARK)) return null;
+  if (_badHosts.has(third)) return null;
+  if (LINK_BLOCK_RE.test(String(third.className || ''))) return null;
+  return getComputedStyle(third).display !== 'none' ? third : null;
+}
+
 function _cardHost(): HTMLElement | null {
   const hero = _activeHero();
   if (!hero || !hero.parentElement) return null;
   if (_isOneLevel()) return _pagePanel(); // [lc-1028] Series/Movie：卡挂进各自面板，O8b/N8b 绝对定位右列
   const col = hero.parentElement;
-  return (col.children[2] as HTMLElement) || null;
+  const native = _preferredNativeHost();
+  const made0 = col.querySelector<HTMLElement>('[' + FALLBACK_HOST_MARK + ']');
+  // 原生第三栏可用 → 用它（有演职人员区的剧走这条老路，行为一字不变）
+  if (native) {
+    if (made0 && made0.parentNode === col && made0 !== _colHost) {
+      const c = document.getElementById(CARD_ID);
+      if (c && made0.contains(c)) native.insertBefore(c, native.firstChild || null);
+      if (!made0.firstChild && made0.parentNode) made0.parentNode.removeChild(made0);
+    }
+    // [lc-1188] 原生右栏出现了 → 把卡从自建宿主搬回原生栏（内容零重建），自建宿主撤掉
+    if (_colHost) {
+      const c = document.getElementById(CARD_ID);
+      if (c && _colHost.contains(c)) native.insertBefore(c, native.firstChild || null);
+      if (!_colHost.firstChild) {
+        if (_colHost.parentNode) _colHost.parentNode.removeChild(_colHost);
+        _colHost = null;
+      }
+    }
+    return native;
+  }
+  // [lc-1190] 无可用原生右栏（不存在 / 是链接块 / 被隐藏 / 演职人员区尚未渲染）→ **col 内自建宿主**
+  //  + 同步保活：卡片照旧待在文档流的第 3 个位置，由 beautifyStyle 的 grid 排进右侧 40% 栏 ——
+  //  与有演职人员的剧**完全同一套机制、同样的显示方式**（用户明确不要浮动方案）。
+  return _ensureColHost(col);
 }
 
 function _ensureCardEl(): HTMLElement | null {
-  let card = document.getElementById(CARD_ID) as HTMLElement | null;
-  if (card) return card;
   const host = _cardHost();
   if (!host) return null;
+  let card = document.getElementById(CARD_ID) as HTMLElement | null;
+  if (card) {
+    // [lc-1188] 卡已在别处（首次渲染时原生栏还没出现，先挂了浮动宿主）→ **搬到当前首选宿主**。
+    //  旧写法在此处直接 `return card`，导致原生右栏事后渲染出来也永远搬不回去 ——
+    //  实机现象：所有季页（含带演职人员的正常剧）全部留在「悬浮」形态。
+    if (card.parentNode !== host) {
+      dlog('[lc-1188] 卡片宿主变更 → 搬迁到首选宿主');
+      host.insertBefore(card, host.firstChild || null);
+    }
+    return card;
+  }
   card = document.createElement('div');
   card.id = CARD_ID;
   card.className = 'fnos-beautify-card';
@@ -848,6 +994,58 @@ function _ensureCardEl(): HTMLElement | null {
   return card;
 }
 
+/** [lc-1184] 卡片挂载诊断：输出宿主结构/可见性/卡内容量，便于定位「右侧为空」的真因。
+ *  [lc-1185] 改为「状态指纹变化才打」+ 总条数上限（10 条）——这样能完整看到
+ *  「挂上 → 被 React 冲掉 → 补挂」的整个时序，而不是只有第一帧快照。 */
+let _mountDiagCount = 0;
+let _mountDiagLast = '';
+function logMountDiag(tag: string, card?: HTMLElement | null): void {
+  if (_mountDiagCount >= 10) return;
+  try {
+    const hero = _activeHero();
+    const col = hero ? hero.parentElement : null;
+    if (!col) {
+      if (_mountDiagLast === tag + '|nohero') return;
+      _mountDiagLast = tag + '|nohero'; _mountDiagCount++;
+      log('[lc-1185][卡诊断] ' + tag + ' | hero 未找到');
+      return;
+    }
+    const kids: string[] = [];
+    for (let i = 0; i < col.children.length; i++) {
+      const el = col.children[i] as HTMLElement;
+      kids.push(i + ':' + el.tagName + '[' + String(el.className || '').replace(/\s+/g, ' ').substring(0, 26)
+        + ']{' + getComputedStyle(el).display + '}');
+    }
+    const cs = getComputedStyle(col);
+    const stills = (_tmdbInfoData && Array.isArray((_tmdbInfoData as any).backdrops))
+      ? ((_tmdbInfoData as any).backdrops as any[]).filter(Boolean).length : -1;
+    const parentStr = card
+      ? (card.parentNode
+        ? ((card.parentNode as HTMLElement).tagName + '['
+          + String((card.parentNode as HTMLElement).className || '').substring(0, 18) + ']{'
+          + getComputedStyle(card.parentNode as HTMLElement).display + '}')
+        : 'null')
+      : '-';
+    const msg = '[lc-1185][卡诊断] ' + tag
+      + ' | children=' + col.children.length
+      + ' | details=' + !!col.querySelector('[data-id="details"]')
+      + ' | beautify=' + document.body.classList.contains('fnos-beautify')
+      + ' | col{' + cs.display + '/' + cs.gridTemplateColumns + '}'
+      + ' | stills=' + stills
+      + (card ? (' | card{h=' + card.offsetHeight + ',w=' + card.offsetWidth
+        + ',html=' + card.innerHTML.length
+        + ',inDoc=' + document.contains(card)
+        + ',parent=' + parentStr + '}') : ' | card=(未挂载)')
+      + ' | ' + kids.join(' ~ ');
+    const fp = tag + '|' + col.children.length + '|' + (card ? (card.offsetHeight + 'x' + card.offsetWidth) : 'n') + '|' + parentStr;
+    if (fp === _mountDiagLast) return;
+    _mountDiagLast = fp; _mountDiagCount++;
+    log(msg);
+  } catch (e) {
+    log('[lc-1185][卡诊断] err ' + String(e).substring(0, 80));
+  }
+}
+
 function _renderCard(): void {
   // [lc-1010] 系列页：TMDB 失败 → 卡已被 _fetch 撤除，这里不再重建错误框
   // （面板 :has(> .fnos-beautify-card) 失配自动收窄回 600px 单列）；季页维持错误框不变。
@@ -855,14 +1053,40 @@ function _renderCard(): void {
   const card = _ensureCardEl();
   if (!card) {
     // [lc-1020] 宿主（季页演职人员区 / 系列页面板）还没渲染 → 有界重试，不再永久放弃
+    logMountDiag('宿主缺失');
     _armMountRetry();
     return;
   }
+  // [lc-1184] 挂载后延迟 400ms 量一次卡的真实尺寸/内容量（此时内容与图片已填充）——
+  //  「卡在 DOM 但不可见」与「卡可见但空白」是两种完全不同的故障，靠这条一眼区分。
+  //  [lc-1185] 顺便自愈：挂上却零尺寸 = 宿主已脱离布局（React 重建 col 时挤走自建宿主），
+  //  这里主动重建挂点 —— 不能只等 MutationObserver，因为 DOM 稳定后不会再有变化事件。
+  window.setTimeout(() => {
+    const c = document.getElementById(CARD_ID) as HTMLElement | null;
+    logMountDiag('已挂载', c);
+    if (c && c.offsetHeight === 0 && c.offsetWidth === 0) {
+      // [lc-1189] 零尺寸 → 先把当前宿主拉黑（仅限原生宿主；浮动宿主零尺寸是位置/样式问题，
+      //  拉黑它会导致无宿主可用）。下次选宿主时就会自动降级到浮动宿主，不再死循环重建同一个坏宿主。
+      const p = c.parentNode as HTMLElement | null;
+      if (p && !p.hasAttribute(FALLBACK_HOST_MARK)) {
+        _badHosts.add(p);
+        dlog('[lc-1189] 宿主 ' + p.tagName + '[' + String(p.className || '').substring(0, 24) + '] 致卡零尺寸 → 拉黑, 改用浮动宿主');
+      }
+      ensureTmdbCard();
+    }
+  }, 400);
   _disarmMountRetry(); // 已挂上，重试链收队
   let body = '';
   // [lc-1022] 二级(季)页只渲染「剧照」以后的分节 —— 评分/标语/meta/事实/主创/本季与一级页右栏的
   // 同一张卡逐字重复；一级页维持全量。
-  if (_tmdbInfoData) body = buildCardHtml(_tmdbInfoData, { fromStillsOnly: _isSeasonRoute() });
+  // [lc-1184] ⚠ 裁剪版式**以「剧照」为首节**：TMDB 没有剧照时（Bangumi 源新番常见）裁剪后
+  //  整卡只剩页脚，用户观感就是「右边直接为空」。故无剧照时回退全量内容 —— 宁可信息冗余也不留白。
+  if (_tmdbInfoData) {
+    const stillsN = Array.isArray(_tmdbInfoData.backdrops) ? _tmdbInfoData.backdrops.filter(Boolean).length : 0;
+    const trim = _isSeasonRoute() && stillsN > 0;
+    if (_isSeasonRoute() && !trim) dlog('[lc-1184] 本季 TMDB 无剧照, 季页卡回退全量内容(避免空白卡)');
+    body = buildCardHtml(_tmdbInfoData, { fromStillsOnly: trim });
+  }
   // [lc-1039] 季页 loading 换骨架占位（用户要求「骨架图占位」）：按最终版式铺脉冲灰块而非一行文字，
   //   数据到齐整块替换，避免右栏从「什么都没有→一行字→整卡内容」两次跳变。
   //   磁盘缓存命中时 fetch 毫秒级返回，骨架只闪现一瞬甚至不出现。一级页维持原文字（卡在聚簇面板内，另有入场动画）。
@@ -985,7 +1209,65 @@ export function removeTmdbCard(): void {
   const card = document.getElementById(CARD_ID);
   if (card && card.parentNode) card.parentNode.removeChild(card);
   closeStillLightbox(); // [lc-1048] 换页/关美化时若灯箱还开着，一并撤掉
+  // [lc-1180] 连同自建的右栏宿主一起撤（换页后原页面 DOM 可能被缓存复用，空容器留着会污染下一页布局）
+  const made = document.querySelectorAll('[' + FALLBACK_HOST_MARK + ']');
+  for (let i = 0; i < made.length; i++) {
+    const el = made[i];
+    if (el.parentNode) el.parentNode.removeChild(el);
+  }
+  // [lc-1190] 自建宿主引用与同步守卫一并复位（换页后 col 会换成新节点）
+  _colHost = null;
+  _colHostCol = null;
+  if (_colHostObs) { _colHostObs.disconnect(); _colHostObs = null; }
+  _remountKey = '';
+  _remountCount = 0;
   _scheduledFor = null;
   _disarmSeriesPanel();
   _resetState();
+}
+
+/**
+ * [lc-1179] 卡片保活补挂：React 重渲染会连带重建右栏（hero 重排/回填写回后的数据刷新都会触发），
+ * 把我们 append 进飞牛自有子树的卡片一起冲掉 —— 选集按钮有 ensureEpFixButton 同款补挂，
+ * 这张卡此前没有，用户实机表现为「TMDB 卡连刷新按钮一起消失」。
+ * [lc-1185] ⚠ 判定必须按**可见性**而不是"在不在 DOM"：React 把自建宿主从 col 挤走时，
+ *  卡节点往往仍在文档里（只是脱离布局/尺寸归零），`getElementById` 照样命中 → 旧的
+ *  「不在 DOM 才补挂」会直接 return，于是卡永远停在 0×0（实机诊断：card{h=0,w=0,html=159032}
+ *  而 col.children 里已没有自建宿主）。现在改为：卡零尺寸也强制重建挂点。
+ */
+export function ensureTmdbCard(): void {
+  if (!_isSeasonRoute() && !_isOneLevel()) return;                    // 非卡片路由
+  if (!_tmdbInfoData && !_tmdbInfoLoading && !_tmdbInfoError) return; // 从未拉取过（交给正常 schedule 流程）
+  const card = document.getElementById(CARD_ID) as HTMLElement | null;
+  const healthy = !!card && card.offsetHeight > 0 && card.offsetWidth > 0;
+  // [lc-1188] 「健康」还不够，**宿主也要对**：季页首选原生栏（无则浮动宿主）；一级页是聚簇面板。
+  //  否则会出现「卡一切正常，只是待错地方」—— 典型就是首次渲染时原生右栏还没出现、先挂了浮动宿主，
+  //  此后演职人员区渲染出来也没人把它搬回去（旧判定直接 return），实机现象「所有季页全变悬浮」。
+  const native = _preferredNativeHost();
+  const want: HTMLElement | null = _isOneLevel() ? _pagePanel() : (native || _colHost);
+  if (healthy && card && want && card.parentNode === want) return;     // 一切正常
+  // 同页补挂次数上限：避免极端情况下与 React 互相删除形成死循环（空转 CPU）
+  const k = location.pathname;
+  if (_remountKey !== k) { _remountKey = k; _remountCount = 0; }
+  if (_remountCount >= 5) return;
+  _remountCount++;
+  if (healthy && card) {
+    // 内容完好、只是待错宿主 → 搬迁（保持已渲染内容，零重建、零网络）
+    dlog('[lc-1188] 卡片宿主不对 → 搬迁到首选宿主(' + _remountCount + '/5)');
+    _ensureCardEl();
+    return;
+  }
+  if (card) {
+    dlog('[lc-1185] 卡存在但零尺寸(宿主脱离布局) → 重建挂点(' + _remountCount + '/5)');
+    if (card.parentNode) card.parentNode.removeChild(card);
+  } else {
+    dlog('[lc-1179] TMDB 卡被页面重渲染冲掉, 补挂(' + _remountCount + '/5)');
+  }
+  // 清掉遗留的空宿主（React 只删了卡、或自建宿主被挤到 col 外成为孤儿时）
+  const orphans = document.querySelectorAll('[' + FALLBACK_HOST_MARK + ']');
+  for (let i = 0; i < orphans.length; i++) {
+    const el = orphans[i];
+    if (!el.firstChild && el.parentNode) el.parentNode.removeChild(el);
+  }
+  _renderCard(); // _ensureCardEl 内部会重新选/建宿主；宿主缺失时自带有界重试链
 }

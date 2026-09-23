@@ -161,6 +161,8 @@ const episodeCache = new Map<string, number>();
 const markedSet = new Set<string>();
 // 解析失败的 itemGuid（避免重复刷 WARN）
 const missSet = new Set<string>();
+// [lc-1169] 首播已成功标过条目「在看」的 itemGuid（内存节流，重启清零；失败不加入、下次进度事件重试）
+const subjectDoingMarked = new Set<string>();
 
 let _cacheFile = '';
 try { _cacheFile = path.join(app.getPath('userData'), 'bangumi_subject_cache.json'); } catch (e) { _cacheFile = ''; }
@@ -203,36 +205,98 @@ function scheduleSave(): void {
 interface BgSubject { id: number; name: string; name_cn: string; type: number; eps: number; }
 interface BgEpisode { id: number; ep: number; sort: number; name: string; name_cn: string; type: number; }
 
+/** [lc-1173] 搜索原始请求。authFail=true 表示 HTTP 401/403（Token 失效/未授权），与「确认无结果」区分：
+ *  axios 对 4xx 会 throw，旧代码把它和空结果一起静默吞掉，Token 失效时日志只说「无结果」误导排查。 */
+async function searchSubjectRaw(keyword: string): Promise<{ items: BgSubject[]; authFail: boolean }> {
+    try {
+        const resp = await http().post('/v0/search/subjects?limit=10', {
+            keyword,
+            sort: 'match',
+            filter: { type: [2, 6] }, // 2=动画 6=三次元(电视剧/真人)
+        });
+        return { items: (resp.data && resp.data.data) || [], authFail: false };
+    } catch (e: any) {
+        const status = e && e.response && e.response.status;
+        if (status === 401 || status === 403) {
+            log.warn(`搜索「${keyword}」被拒绝(HTTP ${status})：Bangumi Token 失效/未授权，请在设置面板重新生成并填入`);
+            return { items: [], authFail: true };
+        }
+        log.warn(`搜索条目失败「${keyword}」:`, e && e.message);
+        return { items: [], authFail: false };
+    }
+}
+
+/** 标题归一化：去空白与常见中英标点、转小写 —— 供每日放送兜底的包含匹配 */
+function normTitle(s: string): string {
+    return String(s || '').toLowerCase().replace(/[\s·・:：,，。.．\-—_~～「」『』()（）\[\]【】']/g, '');
+}
+
+/**
+ * [lc-1173] 每日放送兜底：Bangumi 搜索 API 对条目名不做模糊容错 —— 刮削标题与 Bangumi
+ * 条目名稍有出入（实测「在超市后门吸烟的二人」vs 条目「…吸烟草的二人」）搜索即返回空。
+ * 每日放送缓存覆盖当季全部新番/新档剧集（含正确的 name_cn，24h 磁盘缓存），归一化后
+ * 双向包含即命中 —— 当季在追的番几乎必然在列，零额外网络请求。
+ */
+async function fallbackSubjectFromCalendar(keyword: string): Promise<number | null> {
+    try {
+        const r: any = await getDailyCached('bangumi_calendar', async () => {
+            const res = await fetchCalendar();
+            if (!res.ok) throw new Error(res.error || 'bangumi fetch failed');
+            return res;
+        }, DEFAULT_TTL_MS);
+        const items: any[] = (r && r.data && r.data.items) || [];
+        const nk = normTitle(keyword);
+        if (!items.length || nk.length < 4) return null; // 过短的词误配风险高
+        let best: any = null;
+        let bestScore = -1;
+        for (const it of items) {
+            for (const nn of [normTitle(it.name_cn), normTitle(it.name)]) {
+                if (!nn) continue;
+                if (nn.includes(nk) || nk.includes(nn)) {
+                    // 命中：长度差越小越可信（多命中时取最接近者）
+                    const score = 1000 - Math.abs(nn.length - nk.length);
+                    if (score > bestScore) { bestScore = score; best = it; }
+                }
+            }
+        }
+        if (best) {
+            log.info(`[Bangumi] 搜索无结果，每日放送兜底命中 subject ${best.id}（${best.name_cn || best.name}）`);
+            return best.id;
+        }
+        return null;
+    } catch (e: any) {
+        log.warn('[Bangumi] 每日放送兜底失败:', e && e.message);
+        return null;
+    }
+}
+
 /** 按标题搜索条目，返回最佳匹配的 subject_id（优先动画 type=2；eps 接近预期者） */
 async function searchSubject(tvTitle: string, expectedEps: number): Promise<number | null> {
     const cached = subjectCache.get(tvTitle);
     if (cached) return cached;
-    try {
-        const resp = await http().post('/v0/search/subjects?limit=10', {
-            keyword: tvTitle,
-            sort: 'match',
-            filter: { type: [2, 6] }, // 2=动画 6=三次元(电视剧/真人)
-        });
-        const items: BgSubject[] = (resp.data && resp.data.data) || [];
-        if (items.length === 0) {
-            log.warn(`搜索「${tvTitle}」无结果`);
-            return null;
+    const { items } = await searchSubjectRaw(tvTitle);
+    if (items.length === 0) {
+        // [lc-1173] 搜索确认无结果 → 每日放送兜底（Bangumi 条目名与刮削标题常有出入）
+        const fb = await fallbackSubjectFromCalendar(tvTitle);
+        if (fb) {
+            subjectCache.set(tvTitle, fb);
+            scheduleSave();
+            return fb;
         }
-        // 排序：优先 type=2(动画)；再按 eps 与预期差距小者；都没有 eps 信息则取首个
-        const scored = items.map(s => ({
-            s,
-            score: (s.type === 2 ? 0 : 1) + (expectedEps > 0 && s.eps > 0 ? Math.abs(s.eps - expectedEps) * 0.01 : 1),
-        }));
-        scored.sort((a, b) => a.score - b.score);
-        const best = scored[0].s;
-        subjectCache.set(tvTitle, best.id);
-        scheduleSave();
-        log.info(`搜索「${tvTitle}」命中 subject ${best.id}（${best.name_cn || best.name}，type=${best.type}，eps=${best.eps}）`);
-        return best.id;
-    } catch (e: any) {
-        log.warn(`搜索条目失败「${tvTitle}」:`, e && e.message);
+        log.warn(`搜索「${tvTitle}」无结果`);
         return null;
     }
+    // 排序：优先 type=2(动画)；再按 eps 与预期差距小者；都没有 eps 信息则取首个
+    const scored = items.map(s => ({
+        s,
+        score: (s.type === 2 ? 0 : 1) + (expectedEps > 0 && s.eps > 0 ? Math.abs(s.eps - expectedEps) * 0.01 : 1),
+    }));
+    scored.sort((a, b) => a.score - b.score);
+    const best = scored[0].s;
+    subjectCache.set(tvTitle, best.id);
+    scheduleSave();
+    log.info(`搜索「${tvTitle}」命中 subject ${best.id}（${best.name_cn || best.name}，type=${best.type}，eps=${best.eps}）`);
+    return best.id;
 }
 
 /** 取条目的正篇剧集列表，找 ep==epNum 的 episode_id */
@@ -295,14 +359,65 @@ export async function syncOnProgress(
     percentage: number,
     _fnapi: any,
     _ts: number,
-    _duration: number,
+    duration: number,
 ): Promise<void> {
     try {
         // 开关与 token 检查
         if (!fnConfig.getBangumiSyncEnabled()) return;
         if (!fnConfig.getBangumiToken()) return;
 
-        // 阈值检查
+        const item = info && info.item;
+        // [lc-1169] 此前「缺 item / 缺标题集号」都静默 return，用户报「99% 看完没同步」却查无原因
+        // —— 全部改为带日志退出，链路可观测。
+        if (!item) {
+            log.warn(`[Bangumi] 播放信息缺 item 字段，跳过本次同步 guid=${itemGuid.slice(0, 8)}`);
+            return;
+        }
+        if (!types.isSyncableItemType(item.type)) {
+            log.info(`[Bangumi] 媒体类型 "${item.type || 'null'}" 不在可同步范围(仅电影/电视节目/混合影片)，跳过 Bangumi 同步`);
+            return;
+        }
+
+        // 电视剧有 tv_title+集号；电影(剧场版)只有标题 —— 用标题搜条目，条目级标记
+        const tvTitle = item.tv_title || '';
+        const epNum = item.episode_number || 0;
+        const isEpisodic = !!(tvTitle && epNum >= 1);
+        const searchTitle = tvTitle || item.title || '';
+        const totalEps = item.number_of_episodes || 0;
+        const isWatched = item.is_watched === 1;
+        if (!searchTitle) {
+            log.warn(`[Bangumi] item 无 tv_title 也无 title，无法搜索条目 guid=${itemGuid.slice(0, 8)}`);
+            return;
+        }
+
+        // [lc-1173] 去重检查提前到首播之前：修复 lc-1169 的自相矛盾 —— 首播失败把 guid 加入
+        // missSet，但 missSet 检查在其后，导致搜索每 15s 重跑一次 + WARN 刷屏（文案说不再重试）。
+        if (markedSet.has(itemGuid)) return;
+        if (missSet.has(itemGuid)) return;
+
+        // [lc-1169] 首播即标条目「在看」（对齐豆瓣 syncOnProgress 的行为）：此前要等到 80% 阈值
+        // 才连条目一起标，用户看一半退出后 Bangumi 上毫无痕迹。节流 = 每 guid 成功标一次；
+        // mediaValid(duration>0) 排除开播前 0/0 空进度事件。
+        // [lc-1173] 搜索失败（搜索+每日放送兜底均无结果）→ missSet，本会话该 guid 不再重试
+        // （missSet 检查已提前，不会刷屏）；网络类失败与「在看」标记失败不加 missSet，下次进度重试。
+        const mediaValid = duration > 0;
+        if (mediaValid && !subjectDoingMarked.has(itemGuid)) {
+            const subjectId = await searchSubject(searchTitle, totalEps);
+            if (!subjectId) {
+                missSet.add(itemGuid);
+                log.warn(`[Bangumi] 无法定位「${searchTitle}」的条目（搜索+每日放送兜底均未命中），本会话跳过该集 guid=${itemGuid.slice(0, 8)}`);
+                return;
+            }
+            const ok = await markSubject(subjectId, SUBJECT_DOING);
+            if (ok) {
+                subjectDoingMarked.add(itemGuid);
+            } else {
+                log.warn(`[Bangumi] 标「在看」失败（subject ${subjectId}），下次进度事件重试`);
+                return;
+            }
+        }
+
+        // 阈值检查：集级「看过」(电视剧) / 条目「看过」(电影) 仍按阈值(默认80%)
         const threshold = fnConfig.getBangumiSyncThreshold();
         if (percentage < threshold) return;
 
@@ -310,23 +425,23 @@ export async function syncOnProgress(
         if (markedSet.has(itemGuid)) return;
         if (missSet.has(itemGuid)) return;
 
-        const item = info && info.item;
-        if (!item) return;
-        if (!types.isSyncableItemType(item.type)) {
-            log.info(`[Bangumi] 媒体类型 "${item.type || 'null'}" 不在可同步范围(仅电影/电视节目/混合影片)，跳过 Bangumi 同步`);
-            return;
-        }
-        const tvTitle = item.tv_title;
-        const epNum = item.episode_number;
-        if (!tvTitle || !epNum || epNum < 1) return;
-
-        const totalEps = item.number_of_episodes || 0;
-        const isWatched = item.is_watched === 1;
-
         // 1. 搜条目拿 subject_id
-        const subjectId = await searchSubject(tvTitle, totalEps);
+        const subjectId = await searchSubject(searchTitle, totalEps);
         if (!subjectId) {
             missSet.add(itemGuid);
+            return;
+        }
+
+        // 电影(剧场版/无集信息)：无 episode 可标，直接把条目标为「看过」。
+        // 此前这条路径会静默穿过到 !epNum 检查被无声吞掉 —— 99% 看完也没同步的根因。
+        if (!isEpisodic) {
+            const ok = await markSubject(subjectId, SUBJECT_COLLECT);
+            if (ok) {
+                markedSet.add(itemGuid);
+                log.info(`已同步：「${searchTitle}」（电影，进度 ${percentage}%）→ Bangumi 条目看过`);
+            } else {
+                missSet.add(itemGuid);
+            }
             return;
         }
 
@@ -337,7 +452,7 @@ export async function syncOnProgress(
             return;
         }
 
-        // 3. 先标条目在看（标集前必须先收藏，否则 400 subject not collected）
+        // 3. 条目「在看」已在首播阶段标过；这里再兜底一次（首播失败恢复的会话）
         await markSubject(subjectId, SUBJECT_DOING);
 
         // 4. 标该集看过
